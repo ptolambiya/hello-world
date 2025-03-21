@@ -1,3 +1,67 @@
+ CREATE TABLE JOB_HISTORY 
+   (	EMPLOYEE_ID NUMBER(6,0) CONSTRAINT JHIST_EMPLOYEE_NN NOT NULL ENABLE, 
+	START_DATE DATE CONSTRAINT JHIST_START_DATE_NN NOT NULL ENABLE, 
+	END_DATE DATE CONSTRAINT JHIST_END_DATE_NN NOT NULL ENABLE, 
+	JOB_ID VARCHAR2(10 BYTE) CONSTRAINT JHIST_JOB_NN NOT NULL ENABLE, 
+	DEPARTMENT_ID NUMBER(4,0)
+   );
+
+
+create or replace 
+PACKAGE JOB_HISTORY_PKG AS 
+
+  /* TODO enter package declarations (types, exceptions, methods etc) here */ 
+PROCEDURE add_job_history
+  (  p_emp_id          job_history.employee_id%type
+   , p_start_date      job_history.start_date%type
+   , p_end_date        job_history.end_date%type
+   , p_job_id          job_history.job_id%type
+   , p_department_id   job_history.department_id%type
+   );
+
+PROCEDURE get_job_history
+  (  p_emp_id          job_history.employee_id%type
+   , p_job_history     out sys_refcursor
+   );
+
+    
+END JOB_HISTORY_PKG;
+/
+
+  create or replace 
+PACKAGE BODY JOB_HISTORY_PKG AS 
+
+  /* TODO enter package declarations (types, exceptions, methods etc) here */ 
+PROCEDURE add_job_history
+  (  p_emp_id          job_history.employee_id%type
+   , p_start_date      job_history.start_date%type
+   , p_end_date        job_history.end_date%type
+   , p_job_id          job_history.job_id%type
+   , p_department_id   job_history.department_id%type
+   )
+IS
+BEGIN
+  INSERT INTO job_history (employee_id, start_date, end_date,
+                           job_id, department_id)
+    VALUES(p_emp_id, p_start_date, p_end_date, p_job_id, p_department_id);
+  
+END add_job_history;
+
+PROCEDURE get_job_history
+  (  p_emp_id          job_history.employee_id%type
+   , p_job_history     out sys_refcursor
+   )
+IS
+BEGIN
+  open p_job_history for select employee_id, start_date, end_date,
+                           job_id, department_id from job_history where employee_id=p_emp_id;
+END get_job_history;
+
+    
+END JOB_HISTORY_PKG;
+/
+  
+
 create or replace 
 PACKAGE pkg_ut_generator AS
   PROCEDURE generate_utplsql(p_package_name IN VARCHAR2);
