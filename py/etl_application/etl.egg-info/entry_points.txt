@@ -1,0 +1,2 @@
+[console_scripts]
+run-etl = etl.services.etl_service:main
