@@ -33,6 +33,36 @@ Insert into HR.SYSTEM_CONFIG (ID,SYSTEM_NAME,SYSTEM_TYPE,IS_ACTIVE,CREATED_AT) v
 Insert into HR.SYSTEM_CONFIG (ID,SYSTEM_NAME,SYSTEM_TYPE,IS_ACTIVE,CREATED_AT) values (4,'LOG_STREAM','KAFKA','Y',to_timestamp('24-03-25 06:04:06.892000000 PM','DD-MM-RR HH12:MI:SS.FF AM'));
 Insert into HR.SYSTEM_CONFIG (ID,SYSTEM_NAME,SYSTEM_TYPE,IS_ACTIVE,CREATED_AT) values (5,'ORACLE_ERP','ORACLE','Y',to_timestamp('24-03-25 06:04:18.554000000 PM','DD-MM-RR HH12:MI:SS.FF AM'));
 Insert into HR.SYSTEM_CONFIG (ID,SYSTEM_NAME,SYSTEM_TYPE,IS_ACTIVE,CREATED_AT) values (11,'ORACLE_HR','ORACLE','Y',to_timestamp('24-03-25 06:13:11.908000000 PM','DD-MM-RR HH12:MI:SS.FF AM'));
+
+INSERT INTO SYSTEM_CONFIG (SYSTEM_NAME, SYSTEM_TYPE, CONNECTION_CONFIG) VALUES (
+    'ORACLE_HR',
+    'ORACLE',
+    '{
+        "host": "localhost",
+        "port": 1521,
+        "service_name": "LOM",
+        "user": "hr",
+        "password": "hr",
+        "conn_timeout": 30
+    }'
+);
+select * from SYSTEM_CONFIG
+"{
+        "jdbc_class": "com.mysql.cj.jdbc.Driver",
+        "jdbc_url": "jdbc:mysql://localhost:3306/sakila",
+        "user": "root",
+        "password": "root",
+        "jars": "libs/mysql-connector-j-9.2.0.jar"
+    }"
+update SYSTEM_CONFIG
+set SYSTEM_TYPE='JDBC',CONNECTION_CONFIG='{
+"jdbc_class": "com.mysql.cj.jdbc.Driver",
+"jdbc_url": "jdbc:mysql://localhost:3306/sakila",
+"user": "root",
+"password": "root",
+"jars": "mysql-connector-j-9.2.0.jar"}' 
+where id=2
+
 --------------------------------------------------------
 --  DDL for Index SYS_C0010701
 --------------------------------------------------------
