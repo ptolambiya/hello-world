@@ -9,7 +9,7 @@ class SystemConfig(Base):
     system_name = Column(String(50), unique=True, nullable=False)
     system_type = Column(String(20), nullable=False)  # ORACLE, MSSQL, DB2, POSTGRES, API, KAFKA
     connection_config = Column(Text, nullable=False)
-    is_active = Column(Boolean, default=True)
+    is_active = Column(String(1), default='Y')
     created_at = Column(DateTime, default=datetime.now)
 
     def __repr__(self):
@@ -21,9 +21,13 @@ class ServiceGroupConfig(Base):
     group_name = Column(String(50), unique=True, nullable=False)
     source_system_id = Column(Integer, ForeignKey('system_config.id'), nullable=False)
     target_system_id = Column(Integer, ForeignKey('system_config.id'), nullable=False)
+    execution_mode = Column(String(50), nullable=False)
     schedule_cron = Column(String(20), nullable=False)
     last_execution = Column(DateTime)
-    is_running = Column(Boolean, default=False)
+    is_active = Column(String(1), default='N')
+    is_running = Column(String(1), default='N')
+    error_threshold = Column(Integer, default=3)
+    error_count = Column(Integer, default=3)
 
     #source_system = relationship("SystemConfig", foreign_keys=[source_system_id])
     #target_system = relationship("SystemConfig", foreign_keys=[target_system_id])
@@ -36,6 +40,7 @@ class ServiceDetailConfig(Base):
     __tablename__ = 'service_detail_config'
     id = Column(Integer, primary_key=True)
     group_id = Column(Integer, ForeignKey('service_group_config.id'), nullable=False)
+    service_detail_name = Column(String(20), nullable=False)  # Query name
     source_type = Column(String(20), nullable=False)  # DATABASE, API, KAFKA
     source_data_type = Column(String(10))  # TABLE, JSON, XML, CSV
     extraction_query = Column(Text)
@@ -44,7 +49,7 @@ class ServiceDetailConfig(Base):
     trim_col_list = Column(Text)
     process_order = Column(Integer, nullable=False)
 
-    #service_group = relationship("ServiceGroupConfig", back_populates="details")
+    service_group = relationship("ServiceGroupConfig", backref="service_details")
     #column_mappings = relationship("ServiceColumnMapping", back_populates="service_detail")
 
     def __repr__(self):
@@ -64,3 +69,11 @@ class ServiceColumnMapping(Base):
 
     def __repr__(self):
         return "id: " + str(self.id) + ", service_detail_id: " + str(self.service_detail_id) +  ", source_path: " + self.source_path + ", destination_column: " + self.destination_column + ", transformation: "+ self.transformation
+
+class ExecutionErrorLog(Base):
+    __tablename__ = 'execution_error_log'
+    id = Column(Integer, primary_key=True)
+    group_id = Column(Integer, ForeignKey('service_group_config.id'))
+    service_detail_id = Column(Integer, ForeignKey('service_detail_config.id'))
+    log_time = Column(DateTime, default=datetime.now)
+    error_detail = Column(Text)

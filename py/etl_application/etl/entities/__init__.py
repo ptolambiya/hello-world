@@ -2,12 +2,14 @@ from .config import (
     SystemConfig,
     ServiceGroupConfig,
     ServiceDetailConfig,
-    ServiceColumnMapping
+    ServiceColumnMapping,
+    ExecutionErrorLog
 )
 
 __all__ = [
     'SystemConfig',
     'ServiceGroupConfig',
     'ServiceDetailConfig',
-    'ServiceColumnMapping'
+    'ServiceColumnMapping',
+    'ExecutionErrorLog'
 ]

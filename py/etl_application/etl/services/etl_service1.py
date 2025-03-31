@@ -1,5 +1,7 @@
 from datetime import datetime
 from sqlalchemy.exc import DatabaseError
+from etl.utils.logger import logger
+from etl.entities.config import ExecutionErrorLog
 
 from etl.db.base import DBMixin
 from etl.repositories import (

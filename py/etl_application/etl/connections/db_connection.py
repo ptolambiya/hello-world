@@ -6,6 +6,7 @@ import json
 import jaydebeapi
 import cx_Oracle
 import os
+from etl.utils.logger import log
 
 from etl.entities.config import (
     SystemConfig,
@@ -147,7 +148,7 @@ class DatabaseConnection(BaseConnection):
         
         #print(mapped_data)
         if not mapped_data:
-            print("No columns matched between source and destination")
+            log.error("No columns matched between source and destination")
             return
 
         try:
@@ -162,10 +163,10 @@ class DatabaseConnection(BaseConnection):
                 batch = mapped_data[i:i + BATCH_SIZE]
                 target_transaction.execute(stmt,batch)  # executemany() runs automatically
                 #target_transaction.commit()  # Commit after each batch
-                print(f"Inserted {len(batch)} rows in Batch.")
-            print(f"Successfully inserted {len(mapped_data)} rows into {table_name}")
+                #log.info(f"Inserted {len(batch)} rows in Batch.")
+            #log.info(f"Successfully inserted {len(mapped_data)} rows into {table_name}")
         except Exception as e:
-            print(f"Database insert error: {str(e)}")
+            log.error(f"Database insert error: {str(e)}")
             raise
 
     def truncate_table(self,target_transaction,destination_table:str):

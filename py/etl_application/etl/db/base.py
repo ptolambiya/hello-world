@@ -6,6 +6,7 @@ Base = declarative_base()
 
 class DBMixin:
     def __init__(self, local_db_uri: str):
+        self.local_db_uri = local_db_uri
         self.local_engine = create_engine(local_db_uri)
         self.local_session_factory = sessionmaker(bind=self.local_engine)
         self.LocalSession = scoped_session(self.local_session_factory)
