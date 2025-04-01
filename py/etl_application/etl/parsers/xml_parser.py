@@ -2,7 +2,7 @@ from lxml import etree
 from io import BytesIO
 from etl.parsers.base_parser import BaseParser
 
-class XmlParser(BaseParser):
+class XmlParser(BaseParser, data_type="XML"):
     def parse(self, raw_data):
         parsed = []
         for xml_str in raw_data:

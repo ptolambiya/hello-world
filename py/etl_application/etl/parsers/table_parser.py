@@ -1,7 +1,7 @@
 from etl.parsers.base_parser import BaseParser
 from datetime import datetime
 
-class TableParser(BaseParser):
+class TableParser(BaseParser, data_type="TABLE"):
     def parse(self, raw_data):
         if not self.mappings:
             #print(raw_data)

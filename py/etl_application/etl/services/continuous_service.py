@@ -34,6 +34,7 @@ class ContinuousETLProcessor(DBMixin):
         def processor():
             while self.running:
                 etl = ETLService(self.local_db_uri)
+                time.sleep(5)
                 try:
                     etl.run_etl_group(group.group_name)
                 except Exception as e:

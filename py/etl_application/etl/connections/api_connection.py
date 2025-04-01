@@ -2,7 +2,7 @@ import requests
 from json import JSONDecodeError
 from etl.connections.base_connection import BaseConnection
 
-class APIConnection(BaseConnection):
+class APIConnection(BaseConnection, system_types=["API"]):
     def __init__(self):
         self.session = None
         self.config = None

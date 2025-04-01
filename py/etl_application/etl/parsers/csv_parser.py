@@ -2,7 +2,7 @@ import csv
 from io import StringIO
 from etl.parsers.base_parser import BaseParser
 
-class CsvParser(BaseParser):
+class CsvParser(BaseParser, data_type="CSV"):
     def parse(self, raw_data):
         parsed = []
         for csv_str in raw_data:

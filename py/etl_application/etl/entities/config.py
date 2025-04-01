@@ -68,7 +68,7 @@ class ServiceColumnMapping(Base):
     #service_detail = relationship("ServiceDetailConfig", back_populates="column_mappings")
 
     def __repr__(self):
-        return "id: " + str(self.id) + ", service_detail_id: " + str(self.service_detail_id) +  ", source_path: " + self.source_path + ", destination_column: " + self.destination_column + ", transformation: "+ self.transformation
+        return "id: " + str(self.id) + ", service_detail_id: " + str(self.service_detail_id) +  ", source_path: " + self.source_path + ", destination_column: " + self.destination_column
 
 class ExecutionErrorLog(Base):
     __tablename__ = 'execution_error_log'

@@ -1,7 +1,7 @@
 import jaydebeapi
 from etl.connections.base_connection import BaseConnection
 
-class JDBCConnection(BaseConnection):
+class JDBCConnection(BaseConnection, system_types=["JDBC"]):
     def __init__(self):
         self.conn = None
         self.jars = None

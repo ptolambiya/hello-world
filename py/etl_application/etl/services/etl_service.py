@@ -13,8 +13,8 @@ from etl.repositories import (
     ErrorLogRepository
 )
 
-from etl.connections import DatabaseConnection, APIConnection, KafkaConnection
-from etl.parsers import TableParser, JsonParser, XmlParser, CsvParser
+from etl.connections import BaseConnection, DatabaseConnection, APIConnection, KafkaConnection
+from etl.parsers import BaseParser, TableParser, JsonParser, XmlParser, CsvParser
 
 class ETLService(DBMixin):
 
@@ -28,23 +28,23 @@ class ETLService(DBMixin):
         self.mapping_repo = ServiceColumnMappingRepository(self.session)
         self.error_repo = ErrorLogRepository(self.session)
 
-    CONNECTION_MAP = {
-        'ORACLE': DatabaseConnection,
-        'MSSQL': DatabaseConnection,
-        'MYSQL': DatabaseConnection,
-        'DB2': DatabaseConnection,
-        'POSTGRES': DatabaseConnection,
-        'JDBC': DatabaseConnection,
-        'API': APIConnection,
-        'KAFKA': KafkaConnection
-    }
+    # CONNECTION_MAP = {
+    #     'ORACLE': DatabaseConnection,
+    #     'MSSQL': DatabaseConnection,
+    #     'MYSQL': DatabaseConnection,
+    #     'DB2': DatabaseConnection,
+    #     'POSTGRES': DatabaseConnection,
+    #     'JDBC': DatabaseConnection,
+    #     'API': APIConnection,
+    #     'KAFKA': KafkaConnection
+    # }
     
-    PARSER_MAP = {
-        'TABLE': TableParser,
-        'JSON': JsonParser,
-        'XML': XmlParser,
-        'CSV': CsvParser
-    }
+    # PARSER_MAP = {
+    #     'TABLE': TableParser,
+    #     'JSON': JsonParser,
+    #     'XML': XmlParser,
+    #     'CSV': CsvParser
+    # }
 
 
     
@@ -69,10 +69,10 @@ class ETLService(DBMixin):
                 target_conn.system_type = target_system.system_type
                 target_conn.connect(target_system.connection_config)
                 #target_transaction = target_conn.engine.begin()
+
                 details = self.detail_repo.get_by_group_ordered(group.id)
                 with target_conn.engine.begin() as target_transaction:
                     for detail in details:
-                        #print(detail)
                         self._process_detail(source_conn, target_conn, target_transaction, detail)
 
                 target_transaction.commit()    
@@ -99,10 +99,12 @@ class ETLService(DBMixin):
         try:
             # Extraction
             raw_data = source_conn.extract_data(detail)
-
             # Transformation
             mappings = self.mapping_repo.get_by_service_detail(detail.id)
-            parser = self.PARSER_MAP[detail.source_data_type](mappings)
+            #parser = self.PARSER_MAP[detail.source_data_type](mappings)
+            #parser = BaseParser.get_parser_class(detail.source_data_type)(mappings)
+            parser_cls = BaseParser.get_parser_class(detail.source_data_type)
+            parser = parser_cls(mappings)
             processed_data = parser.parse(raw_data)
             record_count = len(processed_data)
 
@@ -120,14 +122,15 @@ class ETLService(DBMixin):
             # Reset error count on success
             self.group_repo.reset_error_count(detail.service_group)
 
-            log.info(f"END - Group: {detail.group_id} | Service : {detail.service_detail_name} | Records: {record_count}")
+            log.info(f"END - Group: {detail.service_group.group_name} | Service : {detail.service_detail_name} | Records: {record_count}")
         except Exception as e:
             log.error(f"Group {detail.service_group.group_name} | Service : {detail.service_detail_name} | Execution Failed." )
             self._handle_error(detail, e)
             raise
 
     def _get_connection(self, system_type):
-        conn_class = self.CONNECTION_MAP.get(system_type)
+        # conn_class = self.CONNECTION_MAP.get(system_type)
+        conn_class = BaseConnection.get_connection_class(system_type)
         if not conn_class:
             raise ValueError(f"Unsupported system type: {system_type}")
         return conn_class()
@@ -153,7 +156,7 @@ class ETLService(DBMixin):
             updated_group = self.group_repo.increment_error_count(detail.service_group)
             
             if updated_group.is_active == 'N':
-                log.error(f"Group {updated_group.group_name} deactivated due to error threshold")
+                log.info(f"Group {updated_group.group_name} deactivated due to error threshold")
                 
             self.session.commit()
         except Exception as e:

@@ -15,7 +15,7 @@ from etl.entities.config import (
     ServiceColumnMapping
 )
 
-class DatabaseConnection(BaseConnection):
+class DatabaseConnection(BaseConnection, system_types=["ORACLE", "MSSQL", "MYSQL", "POSTGRES", "DB2"]):
     DIALECT_MAP = {
         'ORACLE': 'oracle',
         'MSSQL': 'mssql',
@@ -75,8 +75,8 @@ class DatabaseConnection(BaseConnection):
         # Convert list to a classpath-separated string (":" for Linux/macOS, ";" for Windows)
         classpath_separator = ";" if os.name == "nt" else ":"
         jdbc_driver_path = classpath_separator.join(jar_files)
-        print(jdbc_url)
-        print("jdbc_driver_path :" + jdbc_driver_path)
+        #print(jdbc_url)
+        #print("jdbc_driver_path :" + jdbc_driver_path)
         # Create JDBC connection
         self.engine = create_engine(
             "jdbc+jaydebeapi://",
@@ -122,18 +122,19 @@ class DatabaseConnection(BaseConnection):
     def load_data(self, target_transaction,table_name, data):
         if not data:
             return
-            
+
         # Reflect destination table structure
         metadata = MetaData()
-
         # Reflect the destination table using engine
         #with self.engine.connect() as conn:
         #metadata.reflect(bind=target_transaction, only=[table_name])
-        table = Table(table_name, metadata,autoload_with=self.engine)
-        
+        try:
+            table = Table(table_name.lower(), metadata,autoload_with=self.engine)
+        except Exception as e:
+            log.error(f"Database table error: {str(e)}")
+            raise
         # Get destination column names (case-insensitive)
         dest_columns = {col.name.upper(): col.name for col in table.columns}
-        #print(dest_columns)
         # Map source data to destination columns
         mapped_data = []
         for row in data:
@@ -146,7 +147,6 @@ class DatabaseConnection(BaseConnection):
             if mapped_row:
                 mapped_data.append(mapped_row)
         
-        #print(mapped_data)
         if not mapped_data:
             log.error("No columns matched between source and destination")
             return
