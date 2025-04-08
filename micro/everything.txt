@@ -1,0 +1,1073 @@
+Okay, let's break down the steps to build and deploy your microservice ETL application using Azure Container Apps (ACA), FastAPI, Azure Table Storage for configuration, Confluent Kafka, and Oracle as the destination.
+
+Important Considerations & Assumptions:
+
+Azure Table Storage & SQLAlchemy: SQLAlchemy is designed for relational databases. You cannot use SQLAlchemy directly with Azure Table Storage (a NoSQL key-value store). We will use the azure-data-tables SDK for Python to interact with it in the Configuration Service.
+Oracle Connectivity: Ensure your Oracle database is accessible from the Azure network where your ACA environment will reside. This might involve VNet integration for ACA, firewall rules on the Oracle side, or using Oracle Cloud Infrastructure with proper peering/interconnects. You'll need Oracle Instant Client libraries installed in your Loader and Extractor service containers.
+Confluent Kafka: Assuming you have a Confluent Cloud cluster or a self-managed Kafka cluster accessible from Azure. You'll need the bootstrap server details and any necessary credentials.
+Error Handling & Monitoring: The provided code skeletons will be basic. Production code needs robust error handling, retries (especially for network calls and DB operations), comprehensive logging (sending logs to Azure Log Analytics), and monitoring (metrics).
+Security: Connection strings, API keys, and other secrets should never be hardcoded. We'll use environment variables injected by Azure Container Apps, ideally backed by Azure Key Vault. Use Managed Identities for accessing Azure resources (Storage, potentially Key Vault) where possible.
+Data Volume: The approach using Azure Blob Storage as intermediate staging is suitable for batch processing and handles larger volumes better than passing data directly via API calls.
+Phase 1: Azure Resource Setup (Azure Portal or Azure CLI)
+
+Resource Group: Create a Resource Group to hold all related resources.
+Bash
+
+az group create --name YourResourceGroupName --location YourAzureRegion # e.g., eastus
+Azure Storage Account: Needed for Configuration (Tables) and Data Staging (Blobs).
+Bash
+
+az storage account create --name youruniquestorageaccount --resource-group YourResourceGroupName --location YourAzureRegion --sku Standard_LRS --kind StorageV2
+# Get Connection String (Needed for local dev / initial config, use Managed Identity in ACA later)
+az storage account show-connection-string --name youruniquestorageaccount --resource-group YourResourceGroupName --output tsv
+Azure Container Registry (ACR): To store your Docker images.
+Bash
+
+az acr create --resource-group YourResourceGroupName --name youruniqueacrname --sku Basic --admin-enabled true # Use managed identity later if preferred over admin
+Log Analytics Workspace: Required by ACA Environment.
+Bash
+
+az monitor log-analytics workspace create --resource-group YourResourceGroupName --workspace-name YourLogAnalyticsWorkspace --location YourAzureRegion
+Azure Container Apps Environment: The runtime environment for your apps. Connect it to your Log Analytics workspace. (VNet integration is optional but likely needed for private Oracle/Kafka access).
+Bash
+
+# Optional: If VNet integration is needed, prepare subnet first
+# az network vnet create ...
+# az network vnet subnet create ...
+# subnet_id=$(az network vnet subnet show ... --query id --output tsv)
+
+az containerapp env create --name YourACAEnvironmentName --resource-group YourResourceGroupName --location YourAzureRegion --logs-workspace-id $(az monitor log-analytics workspace show --resource-group YourResourceGroupName --workspace-name YourLogAnalyticsWorkspace --query customerId -o tsv) --logs-workspace-key $(az monitor log-analytics workspace get-shared-keys --resource-group YourResourceGroupName --workspace-name YourLogAnalyticsWorkspace --query primarySharedKey -o tsv)
+# If using VNet: --infrastructure-subnet-resource-id $subnet_id --internal-load-balancer-outbound-ip-addresses false (or true depending on needs)
+Oracle Database: Ensure your target Oracle DB is set up and accessible. Note its connection details (Host, Port, Service Name/SID, User, Password).
+Confluent Kafka: Ensure your cluster is running. Note the Bootstrap Servers URL and any API keys/secrets needed for authentication.
+Azure Table Storage Setup:
+Within your Azure Storage Account, navigate to "Tables" (under Data storage).
+Create the necessary tables (e.g., Groups, Flows, Mappings, Schedules, KafkaListeners).
+Define your schema thinking in key-value terms (PartitionKey, RowKey are mandatory and indexed).
+Example Flows Table:
+PartitionKey: Could be the GroupName (to query all flows for a group efficiently).
+RowKey: Unique FlowID.
+Other properties: SourceType (CSV, API, DB, KAFKA), SourceConfig (JSON string with connection/path/query/topic), DestinationType (Oracle, Postgres), DestinationConfig (JSON string with connection details/table name), MappingConfig (JSON string defining column mappings).
+Example Mappings Table:
+PartitionKey: FlowID.
+RowKey: Source Column Name.
+Other properties: DestinationColumnName, DataType, TransformationRule (optional).
+Phase 2: Local Development Environment Setup
+
+Install Tools: Python 3.9+, Docker Desktop, Azure CLI, VS Code (recommended).
+Project Structure: Create a root directory. Inside, create a directory for each microservice (e.g., config_service, scheduler_service, flow_orchestrator, etc.).
+Virtual Environments: In each microservice directory, create and activate a Python virtual environment:
+Bash
+
+cd config_service
+python -m venv .venv
+source .venv/bin/activate # Linux/macOS
+# .\.venv\Scripts\activate # Windows
+Git: Initialize a Git repository.
+Phase 3: Microservice Implementation (Python Code using FastAPI)
+
+For each service, you'll typically have:
+
+main.py: FastAPI app initialization, routers.
+routers/: Directory for API route definitions.
+services/: Directory for business logic.
+models/: Directory for Pydantic models (request/response validation).
+config.py: Configuration loading (from environment variables).
+requirements.txt: Python dependencies.
+Dockerfile: Container build instructions.
+Service 1: Configuration Service
+
+Purpose: API to manage ETL configurations stored in Azure Table Storage.
+requirements.txt:
+fastapi uvicorn python-dotenv azure-data-tables pydantic
+config.py:
+Python
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv() # Loads .env file for local development
+
+AZURE_TABLE_STORAGE_CONN_STR = os.getenv("AZURE_TABLE_STORAGE_CONN_STR")
+services/table_service.py: (Illustrative - adapt table/entity names)
+Python
+
+from azure.data.tables import TableServiceClient, TableEntity
+from config import AZURE_TABLE_STORAGE_CONN_STR
+import json
+
+class ConfigTableService:
+    def __init__(self, connection_string: str):
+        self.service_client = TableServiceClient.from_connection_string(conn_str=connection_string)
+
+    def get_table_client(self, table_name: str):
+        return self.service_client.get_table_client(table_name)
+
+    def get_flow_details(self, flow_id: str, group_name: str) -> dict | None:
+        table_client = self.get_table_client("Flows")
+        try:
+            entity = table_client.get_entity(partition_key=group_name, row_key=flow_id)
+            # Deserialize JSON string properties if needed
+            entity['SourceConfig'] = json.loads(entity.get('SourceConfig', '{}'))
+            entity['DestinationConfig'] = json.loads(entity.get('DestinationConfig', '{}'))
+            entity['MappingConfig'] = json.loads(entity.get('MappingConfig', '{}'))
+            return entity
+        except Exception as e: # Be more specific in production (ResourceNotFoundError)
+            print(f"Error getting flow {flow_id}: {e}")
+            return None
+
+    def get_flows_by_group(self, group_name: str) -> list[dict]:
+         table_client = self.get_table_client("Flows")
+         entities = table_client.query_entities(query_filter=f"PartitionKey eq '{group_name}'")
+         flows = []
+         for entity in entities:
+             entity['SourceConfig'] = json.loads(entity.get('SourceConfig', '{}'))
+             entity['DestinationConfig'] = json.loads(entity.get('DestinationConfig', '{}'))
+             entity['MappingConfig'] = json.loads(entity.get('MappingConfig', '{}'))
+             flows.append(entity)
+         return flows
+
+    # --- Add methods for other tables (Groups, Mappings, Schedules, KafkaListeners) ---
+    def get_schedules(self) -> list[dict]:
+        table_client = self.get_table_client("Schedules")
+        entities = table_client.list_entities() # Get all schedules
+        # Add parsing if needed
+        return list(entities)
+
+    def get_kafka_listeners(self) -> list[dict]:
+        table_client = self.get_table_client("KafkaListeners")
+        entities = table_client.list_entities() # Get all listeners
+        # Add parsing if needed
+        return list(entities)
+
+config_service = ConfigTableService(AZURE_TABLE_STORAGE_CONN_STR)
+routers/config_router.py:
+Python
+
+from fastapi import APIRouter, HTTPException
+from services.table_service import config_service
+
+router = APIRouter()
+
+@router.get("/flows/{group_name}/{flow_id}")
+async def read_flow(group_name: str, flow_id: str):
+    flow = config_service.get_flow_details(flow_id, group_name)
+    if flow is None:
+        raise HTTPException(status_code=404, detail="Flow not found")
+    return flow
+
+@router.get("/groups/{group_name}/flows")
+async def read_group_flows(group_name: str):
+    flows = config_service.get_flows_by_group(group_name)
+    return {"flows": flows}
+
+@router.get("/schedules")
+async def read_schedules():
+    schedules = config_service.get_schedules()
+    return {"schedules": schedules}
+
+@router.get("/kafka_listeners")
+async def read_kafka_listeners():
+    listeners = config_service.get_kafka_listeners()
+    return {"listeners": listeners}
+
+# --- Add endpoints for other configurations ---
+main.py:
+Python
+
+from fastapi import FastAPI
+from routers import config_router
+
+app = FastAPI(title="Configuration Service")
+app.include_router(config_router.router, prefix="/api/v1/config")
+
+@app.get("/")
+def read_root():
+    return {"message": "Configuration Service Running"}
+Service 2: Scheduler Service
+
+Purpose: Triggers scheduled flows based on CRON expressions.
+requirements.txt:
+fastapi uvicorn python-dotenv apscheduler httpx pydantic
+config.py: Load CONFIG_SERVICE_URL, ORCHESTRATOR_SERVICE_URL.
+services/scheduling_service.py:
+Python
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+import httpx
+import asyncio
+from config import CONFIG_SERVICE_URL, ORCHESTRATOR_SERVICE_URL
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+scheduler = AsyncIOScheduler()
+
+async def trigger_flow(flow_id: str, group_name: str):
+    """Calls the Flow Orchestrator to start a specific flow."""
+    url = f"{ORCHESTRATOR_SERVICE_URL}/api/v1/orchestrator/run/flow"
+    payload = {"flow_id": flow_id, "group_name": group_name}
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(url, json=payload, timeout=30.0) # Adjust timeout
+            response.raise_for_status()
+            logger.info(f"Successfully triggered flow {group_name}/{flow_id}. Response: {response.json()}")
+        except httpx.RequestError as exc:
+            logger.error(f"HTTP error triggering flow {group_name}/{flow_id}: {exc}")
+        except Exception as exc:
+             logger.error(f"Error triggering flow {group_name}/{flow_id}: {exc}")
+
+
+async def trigger_group(group_name: str, flow_ids: list[str]):
+    """Fetches flows for a group and triggers them."""
+    logger.info(f"CRON triggered for group: {group_name}. Flows: {flow_ids}")
+    # In a real scenario, you might fetch flow IDs dynamically here if needed,
+    # but the schedule config likely lists the group_name and maybe associated flows.
+    # Assuming flow_ids are passed correctly from the schedule job definition.
+    tasks = [trigger_flow(flow_id, group_name) for flow_id in flow_ids]
+    await asyncio.gather(*tasks)
+
+
+async def load_and_schedule_jobs():
+    """Fetches schedules from Config Service and adds/updates jobs."""
+    logger.info("Loading schedules from Configuration Service...")
+    url = f"{CONFIG_SERVICE_URL}/api/v1/config/schedules"
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(url)
+            response.raise_for_status()
+            schedules = response.json().get("schedules", [])
+            logger.info(f"Found {len(schedules)} schedules.")
+
+            # Simple approach: remove all jobs and add new ones
+            # More robust: Update existing jobs based on ID
+            scheduler.remove_all_jobs()
+
+            for schedule in schedules:
+                job_id = schedule.get("RowKey") # Unique ID for the schedule job
+                group_name = schedule.get("GroupName")
+                cron_expression = schedule.get("CronExpression")
+                # Assuming schedule config contains list of flows directly or indirectly
+                flow_ids_str = schedule.get("FlowIDs") # e.g., "flow1,flow2"
+                is_enabled = schedule.get("IsEnabled", False)
+
+                if job_id and group_name and cron_expression and flow_ids_str and is_enabled:
+                    flow_ids = [f.strip() for f in flow_ids_str.split(',')]
+                    try:
+                        scheduler.add_job(
+                            trigger_group,
+                            CronTrigger.from_crontab(cron_expression),
+                            args=[group_name, flow_ids],
+                            id=job_id,
+                            name=f"Group_{group_name}",
+                            replace_existing=True,
+                        )
+                        logger.info(f"Scheduled job '{job_id}' for group '{group_name}' with CRON '{cron_expression}'")
+                    except Exception as e:
+                        logger.error(f"Failed to schedule job '{job_id}': {e}")
+                else:
+                    logger.warning(f"Skipping invalid schedule config: {schedule}")
+
+        except httpx.RequestError as exc:
+            logger.error(f"Could not fetch schedules from Config Service: {exc}")
+        except Exception as e:
+             logger.error(f"Error processing schedules: {e}")
+
+async def start_scheduler():
+    await load_and_schedule_jobs() # Initial load
+    # TODO: Add logic to periodically reload schedules if needed
+    scheduler.start()
+    logger.info("Scheduler started.")
+
+main.py:
+Python
+
+from fastapi import FastAPI
+import asyncio
+from services.scheduling_service import start_scheduler, scheduler, load_and_schedule_jobs
+
+app = FastAPI(title="Scheduler Service")
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(start_scheduler()) # Run scheduler in background
+
+@app.on_event("shutdown")
+def shutdown_event():
+    scheduler.shutdown()
+
+@app.get("/")
+def read_root():
+    return {"message": "Scheduler Service Running"}
+
+@app.post("/reload_schedules", status_code=202)
+async def reload_schedules_endpoint():
+    """API endpoint to manually trigger schedule reload."""
+    asyncio.create_task(load_and_schedule_jobs())
+    return {"message": "Schedule reload initiated."}
+
+@app.get("/jobs")
+def get_jobs():
+    """List currently scheduled jobs (for debugging)."""
+    jobs = []
+    for job in scheduler.get_jobs():
+        jobs.append({
+            "id": job.id,
+            "name": job.name,
+            "next_run_time": str(job.next_run_time)
+        })
+    return {"jobs": jobs}
+Service 3: Kafka Listener Service
+
+Purpose: Listens to Kafka topics and triggers flows on message arrival.
+requirements.txt:
+fastapi uvicorn python-dotenv confluent-kafka httpx pydantic[dotenv] # pydantic[dotenv] for config
+config.py: Load CONFIG_SERVICE_URL, ORCHESTRATOR_SERVICE_URL, KAFKA_BOOTSTRAP_SERVERS, KAFKA_SASL_USERNAME, KAFKA_SASL_PASSWORD (or other auth), KAFKA_GROUP_ID_PREFIX.
+services/kafka_listener.py:
+Python
+
+from confluent_kafka import Consumer, KafkaError, KafkaException
+import asyncio
+import httpx
+import json
+import logging
+from config import (
+    CONFIG_SERVICE_URL, ORCHESTRATOR_SERVICE_URL, KAFKA_BOOTSTRAP_SERVERS,
+    KAFKA_SASL_USERNAME, KAFKA_SASL_PASSWORD, KAFKA_GROUP_ID_PREFIX
+) # Adapt auth as needed
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Global variable to hold consumer tasks, allows stopping them
+consumer_tasks = {}
+running = True
+
+async def trigger_flow_from_kafka(flow_id: str, group_name: str, message_data: str):
+    """Calls the Flow Orchestrator for a Kafka message."""
+    url = f"{ORCHESTRATOR_SERVICE_URL}/api/v1/orchestrator/run/kafka_flow"
+    payload = {
+        "flow_id": flow_id,
+        "group_name": group_name, # Need group_name associated with the flow
+        "message_data": message_data
+    }
+    async with httpx.AsyncClient() as client:
+        try:
+            logger.debug(f"Triggering Kafka flow {group_name}/{flow_id}")
+            response = await client.post(url, json=payload, timeout=60.0) # Longer timeout?
+            response.raise_for_status()
+            logger.info(f"Successfully triggered Kafka flow {group_name}/{flow_id}. Response: {response.json()}")
+        except httpx.RequestError as exc:
+            logger.error(f"HTTP error triggering Kafka flow {group_name}/{flow_id}: {exc}")
+        except Exception as exc:
+             logger.error(f"Error triggering Kafka flow {group_name}/{flow_id}: {exc}")
+
+
+async def consume_topic(consumer_conf, topic: str, flow_id: str, group_name: str):
+    """Consumes messages from a specific topic."""
+    consumer = Consumer(consumer_conf)
+    try:
+        consumer.subscribe([topic])
+        logger.info(f"Subscribed to topic '{topic}' for flow '{group_name}/{flow_id}'")
+        while running:
+            msg = consumer.poll(timeout=1.0) # Poll for messages
+            if msg is None:
+                await asyncio.sleep(0.1) # Avoid busy-waiting
+                continue
+
+            if msg.error():
+                if msg.error().code() == KafkaError._PARTITION_EOF:
+                    logger.debug(f"Reached end of partition for {topic}")
+                elif msg.error():
+                    logger.error(f"Kafka error on topic {topic}: {msg.error()}")
+                    # Consider adding a delay or break mechanism on persistent errors
+                    await asyncio.sleep(5)
+            else:
+                try:
+                    message_content = msg.value().decode('utf-8')
+                    logger.info(f"Received message on {topic} for flow {group_name}/{flow_id}")
+                    # Run trigger in background, don't block consumer loop
+                    asyncio.create_task(trigger_flow_from_kafka(flow_id, group_name, message_content))
+                    # Manual commit needed if enable.auto.commit=False
+                    # consumer.commit(asynchronous=True)
+                except Exception as e:
+                    logger.error(f"Error processing message from {topic}: {e}")
+                    # Decide how to handle poison pills/bad messages
+
+            await asyncio.sleep(0.01) # Yield control briefly
+
+    except KafkaException as e:
+         logger.error(f"Kafka configuration/subscription error for topic {topic}: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error in consumer for topic {topic}: {e}")
+    finally:
+        logger.info(f"Closing consumer for topic {topic}")
+        consumer.close()
+
+
+async def load_and_start_listeners():
+    """Fetches Kafka listener configs and starts consumers."""
+    global running
+    running = True
+    logger.info("Loading Kafka listeners from Configuration Service...")
+    url = f"{CONFIG_SERVICE_URL}/api/v1/config/kafka_listeners"
+    listeners = []
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            listeners = response.json().get("listeners", [])
+            logger.info(f"Found {len(listeners)} Kafka listeners.")
+    except Exception as e:
+        logger.error(f"Could not fetch Kafka listeners: {e}")
+        return # Cannot proceed without config
+
+    # Stop existing consumers before starting new ones
+    await stop_listeners()
+
+    for listener_conf in listeners:
+        topic = listener_conf.get("TopicName")
+        flow_id = listener_conf.get("FlowID")
+        group_name = listener_conf.get("GroupName") # Ensure GroupName is in config table
+        is_enabled = listener_conf.get("IsEnabled", False)
+        # Unique group.id per listener instance/deployment potentially
+        consumer_group_id = f"{KAFKA_GROUP_ID_PREFIX}-{group_name}-{flow_id}"
+
+        if topic and flow_id and group_name and is_enabled:
+             # Basic Kafka Consumer Config (Adapt security protocol as needed)
+             conf = {
+                 'bootstrap.servers': KAFKA_BOOTSTRAP_SERVERS,
+                 'group.id': consumer_group_id,
+                 'security.protocol': 'SASL_SSL', # Example, adjust based on Confluent Cloud setup
+                 'sasl.mechanisms': 'PLAIN',
+                 'sasl.username': KAFKA_SASL_USERNAME,
+                 'sasl.password': KAFKA_SASL_PASSWORD,
+                 'auto.offset.reset': 'earliest', # Or 'latest'
+                 'enable.auto.commit': True # Set to False for manual commits
+                 # Add other relevant Kafka consumer properties
+             }
+             logger.info(f"Starting consumer task for topic '{topic}', flow '{group_name}/{flow_id}'")
+             task = asyncio.create_task(consume_topic(conf, topic, flow_id, group_name))
+             consumer_tasks[f"{group_name}/{flow_id}"] = task
+        else:
+            logger.warning(f"Skipping invalid Kafka listener config: {listener_conf}")
+
+async def stop_listeners():
+    """Stops all running consumer tasks."""
+    global running
+    running = False
+    logger.info(f"Stopping {len(consumer_tasks)} Kafka consumers...")
+    for task_id, task in consumer_tasks.items():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            logger.info(f"Consumer task {task_id} cancelled.")
+        except Exception as e:
+            logger.error(f"Error stopping task {task_id}: {e}")
+    consumer_tasks.clear()
+    logger.info("All Kafka consumers stopped.")
+
+main.py:
+Python
+
+from fastapi import FastAPI
+import asyncio
+from services.kafka_listener import load_and_start_listeners, stop_listeners
+
+app = FastAPI(title="Kafka Listener Service")
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(load_and_start_listeners()) # Run listeners in background
+
+@app.on_event("shutdown")
+async def shutdown_event():
+   await stop_listeners()
+
+@app.get("/")
+def read_root():
+    return {"message": "Kafka Listener Service Running"}
+
+@app.post("/reload_listeners", status_code=202)
+async def reload_listeners_endpoint():
+    """API endpoint to manually trigger listener reload."""
+    asyncio.create_task(load_and_start_listeners()) # This will stop old and start new
+    return {"message": "Kafka listener reload initiated."}
+Service 4: Flow Orchestrator Service
+
+Purpose: Coordinates the steps (Extract, Parse, Load) for a single flow run.
+requirements.txt:
+fastapi uvicorn python-dotenv httpx pydantic[dotenv]
+config.py: Load CONFIG_SERVICE_URL, EXTRACTOR_SERVICE_URL, PARSER_SERVICE_URL, LOADER_SERVICE_URL.
+models/flow_models.py:
+Python
+
+from pydantic import BaseModel
+
+class FlowRunRequest(BaseModel):
+    flow_id: str
+    group_name: str
+
+class KafkaFlowRunRequest(FlowRunRequest):
+    message_data: str # Raw message data as string
+routers/orchestrator_router.py:
+Python
+
+from fastapi import APIRouter, HTTPException, BackgroundTasks
+import httpx
+import logging
+from config import CONFIG_SERVICE_URL, EXTRACTOR_SERVICE_URL, PARSER_SERVICE_URL, LOADER_SERVICE_URL
+from models.flow_models import FlowRunRequest, KafkaFlowRunRequest
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+async def execute_flow_steps(flow_id: str, group_name: str, kafka_message_data: str | None = None):
+    """The core logic to run a flow's steps."""
+    logger.info(f"Starting orchestration for flow: {group_name}/{flow_id}")
+    raw_data_location = None
+    processed_data_location = None
+    flow_config = None
+
+    async with httpx.AsyncClient(timeout=None) as client: # Use appropriate timeouts
+        # 1. Get Flow Configuration
+        try:
+            config_url = f"{CONFIG_SERVICE_URL}/api/v1/config/flows/{group_name}/{flow_id}"
+            response = await client.get(config_url)
+            response.raise_for_status()
+            flow_config = response.json()
+            logger.info(f"Fetched config for flow {group_name}/{flow_id}")
+        except Exception as e:
+            logger.error(f"Failed to get config for flow {group_name}/{flow_id}: {e}")
+            return # Cannot proceed
+
+        source_type = flow_config.get("SourceType", "").upper()
+        source_config = flow_config.get("SourceConfig", {})
+        mapping_config = flow_config.get("MappingConfig", {}) # Mapping needed by Parser
+        destination_config = flow_config.get("DestinationConfig", {}) # Destination needed by Loader
+
+        # 2. Extract Data (Skip for Kafka)
+        if source_type != "KAFKA":
+            try:
+                extract_url = f"{EXTRACTOR_SERVICE_URL}/api/v1/extract"
+                payload = {"source_type": source_type, "source_config": source_config}
+                logger.info(f"Calling Extractor for flow {group_name}/{flow_id}")
+                response = await client.post(extract_url, json=payload)
+                response.raise_for_status()
+                extract_result = response.json()
+                raw_data_location = extract_result.get("data_location")
+                if not raw_data_location:
+                     raise ValueError("Extractor did not return data location")
+                logger.info(f"Extractor finished for flow {group_name}/{flow_id}. Data at: {raw_data_location}")
+            except Exception as e:
+                logger.error(f"Extraction failed for flow {group_name}/{flow_id}: {e}")
+                return # Stop flow
+
+        # 3. Parse/Transform Data
+        try:
+            parse_url = f"{PARSER_SERVICE_URL}/api/v1/parse"
+            payload = {
+                "source_type": source_type, # Parser might need to know original format
+                "mapping_config": mapping_config
+            }
+            if source_type == "KAFKA":
+                 # Send Kafka message directly
+                 payload["raw_data"] = kafka_message_data
+            else:
+                 # Send location of extracted data
+                 payload["data_location"] = raw_data_location
+
+            logger.info(f"Calling Parser for flow {group_name}/{flow_id}")
+            response = await client.post(parse_url, json=payload)
+            response.raise_for_status()
+            parse_result = response.json()
+            processed_data_location = parse_result.get("processed_data_location")
+            if not processed_data_location:
+                raise ValueError("Parser did not return processed data location")
+            logger.info(f"Parser finished for flow {group_name}/{flow_id}. Processed data at: {processed_data_location}")
+        except Exception as e:
+            logger.error(f"Parsing failed for flow {group_name}/{flow_id}: {e}")
+            # Consider cleanup of raw_data_location if needed
+            return # Stop flow
+
+        # 4. Load Data
+        try:
+            load_url = f"{LOADER_SERVICE_URL}/api/v1/load"
+            payload = {
+                "data_location": processed_data_location,
+                "destination_config": destination_config
+            }
+            logger.info(f"Calling Loader for flow {group_name}/{flow_id}")
+            response = await client.post(load_url, json=payload)
+            response.raise_for_status()
+            load_result = response.json()
+            logger.info(f"Loader finished for flow {group_name}/{flow_id}. Result: {load_result}")
+            # Add final status logging/reporting
+        except Exception as e:
+            logger.error(f"Loading failed for flow {group_name}/{flow_id}: {e}")
+            # Consider cleanup of processed_data_location
+            return # Flow failed
+
+        # 5. TODO: Cleanup intermediate data in Blob Storage? Optional.
+        logger.info(f"Successfully completed orchestration for flow: {group_name}/{flow_id}")
+
+
+@router.post("/run/flow", status_code=202)
+async def run_scheduled_flow(request: FlowRunRequest, background_tasks: BackgroundTasks):
+    """Endpoint triggered by Scheduler."""
+    logger.info(f"Received request to run scheduled flow: {request.group_name}/{request.flow_id}")
+    # Run the actual flow logic in the background to immediately return 202
+    background_tasks.add_task(execute_flow_steps, request.flow_id, request.group_name)
+    return {"message": "Flow execution initiated"}
+
+
+@router.post("/run/kafka_flow", status_code=202)
+async def run_kafka_flow(request: KafkaFlowRunRequest, background_tasks: BackgroundTasks):
+    """Endpoint triggered by Kafka Listener."""
+    logger.info(f"Received request to run kafka flow: {request.group_name}/{request.flow_id}")
+    background_tasks.add_task(execute_flow_steps, request.flow_id, request.group_name, request.message_data)
+    return {"message": "Kafka flow execution initiated"}
+
+main.py: Standard FastAPI setup including the router.
+Service 5: Extractor Service
+
+Purpose: Extracts data from various sources (DB, API, CSV) and saves to Blob Storage.
+requirements.txt:
+fastapi uvicorn python-dotenv pydantic[dotenv] httpx # For API source
+azure-storage-blob pandas # For CSV/general data handling
+# --- DB Specific ---
+cx_Oracle # For Oracle
+pyodbc # For SQL Server, Sybase, DB2 (if using ODBC)
+mysql-connector-python # For MySQL
+# Add others as needed
+config.py: Load AZURE_STORAGE_CONN_STR, BLOB_CONTAINER_RAW.
+services/blob_storage_service.py: Utility to upload to blob.
+Python
+
+from azure.storage.blob import BlobServiceClient
+from config import AZURE_STORAGE_CONN_STR, BLOB_CONTAINER_RAW
+import uuid
+import os
+
+blob_service_client = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONN_STR)
+
+def upload_to_blob(data: bytes | str, flow_id: str, source_type: str, file_extension: str) -> str:
+    """Uploads data to raw container and returns blob path."""
+    blob_name = f"{flow_id}/{source_type}/{uuid.uuid4()}.{file_extension}"
+    blob_client = blob_service_client.get_blob_client(container=BLOB_CONTAINER_RAW, blob=blob_name)
+    blob_client.upload_blob(data, overwrite=True)
+    # Return path relative to container for consistency
+    return f"{BLOB_CONTAINER_RAW}/{blob_name}"
+
+def upload_dataframe_to_blob(df, flow_id: str, source_type: str, format: str = 'parquet') -> str:
+     """Uploads pandas DataFrame"""
+     blob_name = f"{flow_id}/{source_type}/{uuid.uuid4()}.{format}"
+     blob_client = blob_service_client.get_blob_client(container=BLOB_CONTAINER_RAW, blob=blob_name)
+     # Efficiently stream upload for Parquet/CSV
+     if format == 'parquet':
+         from io import BytesIO
+         buffer = BytesIO()
+         df.to_parquet(buffer, index=False)
+         buffer.seek(0)
+         blob_client.upload_blob(buffer, overwrite=True)
+     elif format == 'csv':
+         from io import StringIO
+         buffer = StringIO()
+         df.to_csv(buffer, index=False)
+         buffer.seek(0)
+         blob_client.upload_blob(buffer.getvalue(), overwrite=True)
+     else:
+         raise ValueError("Unsupported DataFrame format for blob upload")
+     return f"{BLOB_CONTAINER_RAW}/{blob_name}"
+
+
+services/extractors/: Create separate modules for each source type (db_extractor.py, api_extractor.py, csv_extractor.py).
+db_extractor.py: (Example for Oracle)
+Python
+
+import cx_Oracle
+import pandas as pd
+from services.blob_storage_service import upload_dataframe_to_blob
+import logging
+
+logger = logging.getLogger(__name__)
+
+def extract_oracle(config: dict, flow_id: str) -> str:
+    dsn = cx_Oracle.makedsn(config['host'], config['port'], service_name=config['service_name'])
+    query = config['query']
+    logger.info(f"Connecting to Oracle: {config['host']}/{config['service_name']}")
+    try:
+        # Consider using connection pooling for performance
+        with cx_Oracle.connect(user=config['user'], password=config['password'], dsn=dsn) as connection:
+            logger.info(f"Executing query for flow {flow_id}")
+            # Fetch data into Pandas DataFrame for easier handling/upload
+            # Adjust chunking for very large tables if memory is a concern
+            df = pd.read_sql(query, connection)
+            logger.info(f"Fetched {len(df)} rows from Oracle for flow {flow_id}")
+
+        if not df.empty:
+             # Upload as Parquet (efficient)
+            blob_path = upload_dataframe_to_blob(df, flow_id, "oracle_db", format='parquet')
+            logger.info(f"Uploaded Oracle data for flow {flow_id} to {blob_path}")
+            return blob_path
+        else:
+            logger.info(f"No data returned from Oracle query for flow {flow_id}")
+            # Decide how to handle empty results - return None or a specific indicator?
+            return None # Or raise an exception? Or return an empty file marker?
+
+    except cx_Oracle.DatabaseError as e:
+        logger.error(f"Oracle Database Error for flow {flow_id}: {e}")
+        raise # Re-raise to indicate failure
+    except Exception as e:
+        logger.error(f"Error extracting from Oracle for flow {flow_id}: {e}")
+        raise
+Implement similar functions extract_api, extract_csv using httpx and pandas.read_csv respectively, saving results via upload_to_blob or upload_dataframe_to_blob.
+routers/extract_router.py:
+Python
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+import logging
+# Import your extractor functions
+from services.extractors.db_extractor import extract_oracle # Add others
+# from services.extractors.api_extractor import extract_api
+# from services.extractors.csv_extractor import extract_csv
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+class ExtractRequest(BaseModel):
+    flow_id: str = Field(..., description="Unique ID of the flow for context/logging")
+    source_type: str # e.g., "ORACLE_DB", "API", "CSV", "MSSQL_DB" etc.
+    source_config: dict # Connection details, query, URL, path etc.
+
+@router.post("/")
+async def extract_data(request: ExtractRequest):
+    logger.info(f"Received extraction request for flow {request.flow_id}, type: {request.source_type}")
+    data_location = None
+    source_type_upper = request.source_type.upper()
+
+    try:
+        if source_type_upper == "ORACLE_DB":
+            # Need flow_id for blob path naming
+            data_location = extract_oracle(request.source_config, request.flow_id)
+        # elif source_type_upper == "API":
+        #     data_location = extract_api(request.source_config, request.flow_id)
+        # elif source_type_upper == "CSV":
+        #     data_location = extract_csv(request.source_config, request.flow_id)
+        # --- Add other source types ---
+        elif source_type_upper == "KAFKA":
+             # Kafka is handled by listener, extractor shouldn't be called
+             logger.warning(f"Extractor called for KAFKA source type on flow {request.flow_id}. This should not happen.")
+             raise HTTPException(status_code=400, detail="Extractor service does not handle KAFKA sources.")
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported source type: {request.source_type}")
+
+        if data_location:
+             return {"status": "success", "data_location": data_location}
+        else:
+             # Handle cases where extraction resulted in no data but wasn't an error
+             logger.info(f"Extraction for flow {request.flow_id} resulted in no data.")
+             # You might want a specific response for "no data" vs "success"
+             return {"status": "success", "data_location": None, "message": "No data extracted"}
+
+    except HTTPException:
+         raise # Re-raise HTTP exceptions
+    except Exception as e:
+        logger.exception(f"Extraction failed for flow {request.flow_id}: {e}") # Use logger.exception to include stack trace
+        raise HTTPException(status_code=500, detail=f"Internal server error during extraction: {e}")
+main.py: Standard FastAPI setup.
+Service 6: Parser Service
+
+Purpose: Reads raw data (from Blob or direct payload), parses (JSON, CSV, XML), applies mappings, writes standardized data (e.g., JSONL or Parquet) to Blob.
+requirements.txt:
+fastapi uvicorn python-dotenv pydantic[dotenv] azure-storage-blob pandas lxml # lxml for XML
+config.py: Load AZURE_STORAGE_CONN_STR, BLOB_CONTAINER_PROCESSED.
+services/blob_storage_service.py: Add function download_blob_to_dataframe or download_blob_content. Need functions to upload processed data (similar to extractor uploads but to BLOB_CONTAINER_PROCESSED).
+services/parsers/: Modules for different formats (json_parser.py, csv_parser.py, xml_parser.py). These will use pandas or standard libraries (json, csv, xml.etree.ElementTree).
+services/mapper.py: Logic to apply mappings (select, rename columns based on mapping_config).
+Python
+
+import pandas as pd
+import logging
+
+logger = logging.getLogger(__name__)
+
+def apply_mappings(df: pd.DataFrame, mapping_config: dict | list) -> pd.DataFrame:
+    """Applies column selection and renaming based on config."""
+    if not mapping_config:
+        logger.warning("No mapping config provided, returning original DataFrame.")
+        return df
+
+    # Standardize mapping_config format (e.g., always a list of dicts)
+    if isinstance(mapping_config, dict): # Assuming dict maps source_col: dest_col
+        mapping_list = [{"source": k, "destination": v} for k, v in mapping_config.items()]
+    elif isinstance(mapping_config, list):
+         # Assuming list of {'source': 'colA', 'destination': 'colX'}
+         mapping_list = mapping_config
+    else:
+        logger.error(f"Invalid mapping_config format: {type(mapping_config)}")
+        raise ValueError("Invalid mapping configuration format")
+
+
+    rename_map = {item['source']: item['destination'] for item in mapping_list if 'source' in item and 'destination' in item}
+    final_columns = [item['destination'] for item in mapping_list if 'destination' in item]
+
+    # Select columns that exist in the DataFrame and are in the source mapping
+    cols_to_select = [item['source'] for item in mapping_list if item['source'] in df.columns]
+    if not cols_to_select:
+         logger.error("No source columns from mapping found in DataFrame.")
+         # Return empty DF with target columns? Or raise error?
+         return pd.DataFrame(columns=final_columns)
+
+    processed_df = df[cols_to_select].copy()
+
+    # Rename columns
+    processed_df.rename(columns=rename_map, inplace=True)
+
+    # Ensure all destination columns are present, add missing ones with None/NaN
+    for col in final_columns:
+        if col not in processed_df.columns:
+            processed_df[col] = None # Or pd.NA
+
+    # Return only the final desired columns in the correct order
+    return processed_df[final_columns]
+
+routers/parse_router.py:
+Accepts data_location (from Blob) or raw_data (for Kafka).
+Accepts source_type hint and mapping_config.
+Downloads data if data_location is provided.
+Calls the appropriate parser based on source_type or data inspection.
+Calls apply_mappings.
+Uploads the resulting DataFrame/data (e.g., as Parquet or JSON Lines) to the processed blob container.
+Returns the processed_data_location.
+main.py: Standard FastAPI setup.
+Service 7: Loader Service
+
+Purpose: Reads processed data from Blob Storage and loads it into the target Oracle database.
+requirements.txt:
+fastapi uvicorn python-dotenv pydantic[dotenv] azure-storage-blob pandas
+cx_Oracle SQLAlchemy # SQLAlchemy can help structure the insert even if using cx_Oracle engine
+config.py: Load AZURE_STORAGE_CONN_STR. Oracle connection details will come in the request payload (destination_config).
+services/blob_storage_service.py: Function to download processed data (e.g., download_blob_to_dataframe).
+services/oracle_loader.py:
+Python
+
+import cx_Oracle
+import pandas as pd
+from sqlalchemy import create_engine # For easier DataFrame upload via pandas
+import logging
+from services.blob_storage_service import download_blob_to_dataframe # Assuming this exists
+
+logger = logging.getLogger(__name__)
+
+def load_to_oracle(data_location: str, dest_config: dict):
+    """Loads data from blob (as DataFrame) into Oracle table."""
+    target_table = dest_config['table_name']
+    batch_size = dest_config.get('batch_size', 1000) # Configurable batch size
+
+    logger.info(f"Starting load process for {data_location} into Oracle table {target_table}")
+
+    try:
+        # 1. Download data from Blob
+        logger.debug(f"Downloading data from {data_location}")
+        # Assuming download_blob_to_dataframe handles parquet/jsonl etc.
+        df = download_blob_to_dataframe(data_location)
+        if df is None or df.empty:
+             logger.info(f"No data found at {data_location} to load.")
+             return {"status": "success", "rows_loaded": 0, "message": "No data to load"}
+        logger.info(f"Downloaded {len(df)} rows from {data_location}")
+
+        # 2. Prepare Oracle Connection (using SQLAlchemy engine for pandas.to_sql)
+        db_user = dest_config['user']
+        db_pass = dest_config['password']
+        db_host = dest_config['host']
+        db_port = dest_config['port']
+        db_service = dest_config['service_name']
+        # Construct DSN or use TNS_ADMIN if configured
+        dsn = cx_Oracle.makedsn(db_host, db_port, service_name=db_service)
+        # sqlalchemy engine string format: oracle+cx_oracle://user:pass@host:port/service_name
+        engine_str = f"oracle+cx_oracle://{db_user}:{db_pass}@{dsn}"
+        engine = create_engine(engine_str)
+
+        # 3. Load data using pandas.to_sql (check performance for huge datasets)
+        logger.info(f"Loading {len(df)} rows into Oracle table {target_table}...")
+        # Note: 'append' will add rows. 'replace' would drop and recreate.
+        # 'if_exists'='append' is common for ETL incremental loads.
+        # 'chunksize' controls rows per INSERT statement.
+        # 'method=multi' might offer performance gains with cx_Oracle, test needed.
+        df.to_sql(
+            name=target_table,
+            con=engine,
+            if_exists='append', # Or 'replace' based on flow logic
+            index=False,
+            chunksize=batch_size,
+            method='multi' # Use 'multi' for potential speedup with cx_Oracle
+        )
+
+        logger.info(f"Successfully loaded {len(df)} rows into {target_table}")
+        return {"status": "success", "rows_loaded": len(df)}
+
+    except FileNotFoundError:
+        logger.error(f"Processed data file not found at {data_location}")
+        raise HTTPException(status_code=404, detail=f"Processed data not found: {data_location}")
+    except cx_Oracle.DatabaseError as e:
+         logger.error(f"Oracle Database Error during load: {e}")
+         raise HTTPException(status_code=500, detail=f"Oracle DB Error: {e}")
+    except Exception as e:
+        logger.exception(f"Failed to load data into Oracle: {e}") # Use exception logger
+        raise HTTPException(status_code=500, detail=f"Internal server error during load: {e}")
+    finally:
+        # Dispose SQLAlchemy engine if created
+        if 'engine' in locals() and engine:
+             engine.dispose()
+
+routers/load_router.py:
+Accepts data_location and destination_config.
+Calls load_to_oracle.
+Returns status.
+main.py: Standard FastAPI setup.
+Phase 4: Containerization (Docker)
+
+Create Dockerfile in each service directory:
+Dockerfile
+
+# Use an official Python runtime as a parent image
+FROM python:3.10-slim
+
+# Set environment variables for Python
+ENV PYTHONDONTWRITEBYTECODE 1
+ENV PYTHONUNBUFFERED 1
+
+# Set the working directory in the container
+WORKDIR /app
+
+# --- Oracle Instant Client Installation (Needed for Extractor & Loader) ---
+# Adjust based on actual Instant Client version and your base image (Debian slim here)
+# Download Basic and SQL*Plus zip files from Oracle beforehand or use wget/curl
+# Example using wget (ensure wget and unzip are installed)
+RUN apt-get update && apt-get install -y wget unzip libaio1 && rm -rf /var/lib/apt/lists/*
+
+# Replace with actual download URLs or ADD local files
+ARG ORACLE_CLIENT_VERSION="19.15" # Example version
+ARG ORACLE_CLIENT_BASE_URL="https://download.oracle.com/otn_software/linux/instantclient"
+RUN wget ${ORACLE_CLIENT_BASE_URL}/${ORACLE_CLIENT_VERSION}/instantclient-basic-linux.x64-${ORACLE_CLIENT_VERSION}.0.0dbru.zip && \
+    wget ${ORACLE_CLIENT_BASE_URL}/${ORACLE_CLIENT_VERSION}/instantclient-sqlplus-linux.x64-${ORACLE_CLIENT_VERSION}.0.0dbru.zip && \
+    unzip instantclient-basic-linux.x64-*.zip -d /opt/oracle && \
+    unzip instantclient-sqlplus-linux.x64-*.zip -d /opt/oracle && \
+    rm *.zip && \
+    # Set Oracle environment variables
+    echo /opt/oracle/instantclient_19_15 > /etc/ld.so.conf.d/oracle-instantclient.conf && \
+    ldconfig
+
+ENV LD_LIBRARY_PATH=/opt/oracle/instantclient_19_15
+ENV PATH=$PATH:/opt/oracle/instantclient_19_15
+# --- End Oracle Instant Client ---
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the rest of the application code
+COPY . .
+
+# Expose the port the app runs on (usually 80 for FastAPI/uvicorn)
+EXPOSE 80
+
+# Command to run the application using Uvicorn
+# Use 0.0.0.0 to bind to all interfaces within the container
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80"]
+Note: You only need the Oracle Instant Client layers in the Extractor and Loader service Dockerfiles. Remove those layers for other services to keep images smaller.
+Download Oracle Instant Client zip files (basic or basiclite, and sqlplus if needed for testing) from the Oracle website and place them in the service directory or use wget as shown (requires finding the correct, stable download URLs which can be tricky). Using ADD with local files is often more reliable.
+Create .dockerignore file in each service directory to exclude virtual environments, __pycache__, etc.
+.venv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+*.env
+.pytest_cache/
+.vscode/
+*.db
+*.sqlite3
+Phase 5: Deployment to Azure Container Apps (ACA)
+
+Build and Push Images: For each service:
+Bash
+
+cd path/to/service_directory
+
+# Login to ACR
+az acr login --name youruniqueacrname
+
+# Build the image
+docker build -t youruniqueacrname.azurecr.io/servicename:v1.0 . # e.g., myetl-acr.azurecr.io/config-service:v1.0
+
+# Push the image
+docker push youruniqueacrname.azurecr.io/servicename:v1.0
+Create Container Apps: For each service, create a Container App in your ACA Environment.
+Bash
+
+az containerapp create \
+    --name servicename-app # e.g., config-service-app
+    --resource-group YourResourceGroupName \
+    --environment YourACAEnvironmentName \
+    --image youruniqueacrname.azurecr.io/servicename:v1.0 \
+    --registry-server youruniqueacrname.azurecr.io \
+    --registry-username $(az acr credential show -n youruniqueacrname --query username -o tsv) \
+    --registry-password $(az acr credential show -n youruniqueacrname --query passwords[0].value -o tsv) \
+    --target-port 80 \ # The port your FastAPI app listens on inside the container
+    --ingress external \ # Or 'internal' if only accessed by other ACA apps in the env
+    --cpu 0.5 --memory 1.0Gi \ # Adjust resources as needed
+    --min-replicas 1 --max-replicas 3 \ # Configure scaling rules
+    --secrets # Define secrets first if using Key Vault refs
+        "azure-storage-conn-str=YourStorageConnectionString" \
+        "oracle-password=YourOraclePassword" \
+        "kafka-password=YourKafkaPassword" \
+        # Add ALL required connection strings/keys here
+    --env-vars # Map secrets or define directly (less secure for sensitive values)
+        "AZURE_TABLE_STORAGE_CONN_STR=secretref:azure-storage-conn-str" \
+        "ORACLE_PASSWORD=secretref:oracle-password" \
+        "KAFKA_SASL_PASSWORD=secretref:kafka-password" \
+        "CONFIG_SERVICE_URL=http://config-service-app.<YOUR_ACA_ENV_DEFAULT_DOMAIN>" \ # ACA provides internal DNS
+        "ORCHESTRATOR_SERVICE_URL=http://flow-orchestrator-app.<YOUR_ACA_ENV_DEFAULT_DOMAIN>" \
+        "EXTRACTOR_SERVICE_URL=http://extractor-service-app.<YOUR_ACA_ENV_DEFAULT_DOMAIN>" \
+        "PARSER_SERVICE_URL=http://parser-service-app.<YOUR_ACA_ENV_DEFAULT_DOMAIN>" \
+        "LOADER_SERVICE_URL=http://loader-service-app.<YOUR_ACA_ENV_DEFAULT_DOMAIN>" \
+        "AZURE_STORAGE_CONN_STR_DIRECT=YourStorageConnectionString" # Sometimes needed directly if Managed Identity isn't used everywhere yet
+        "BLOB_CONTAINER_RAW=raw-data" \
+        "BLOB_CONTAINER_PROCESSED=processed-data" \
+        "KAFKA_BOOTSTRAP_SERVERS=your_kafka_bootstrap_servers" \
+        "KAFKA_SASL_USERNAME=your_kafka_username" \
+        "KAFKA_GROUP_ID_PREFIX=your_etl_prefix" \
+         # Add other env vars for Oracle host/user, etc.
+    # --enable-managed-identity --assign-identity [system] # Highly Recommended for Azure resource access
+    # If using Managed Identity, grant it roles on the Storage Account (e.g., Storage Blob Data Contributor, Storage Table Data Contributor)
+    # You would then modify code to use DefaultAzureCredential instead of connection strings for Blob/Table access
+Internal DNS: ACA apps within the same environment can reach each other using http://<app-name>. You'll need to find the full default domain for your environment if setting URLs explicitly or if accessing from outside the env.
+Secrets: Use --secrets to define sensitive values, then reference them in --env-vars using secretref:. Better yet, integrate with Azure Key Vault.
+Managed Identity: Strongly recommended. Enable it and grant necessary RBAC roles on Azure resources (Storage). Update Python code to use DefaultAzureCredential() from azure-identity library where possible.
+Scaling: Configure scaling rules (--scale-rule-*) based on HTTP traffic, or for Kafka, investigate KEDA integration with ACA for queue-based scaling.
+Phase 6: Configuration & Testing
+
+Populate Config Tables: Use Azure Portal, Azure Storage Explorer, or a script using the azure-data-tables SDK to add entries for your Groups, Flows, Mappings, Schedules, and Kafka Listeners in Azure Table Storage. Ensure JSON configurations within table properties are correctly formatted.
+Initial Deployment Check: Access the root endpoint (/) of each service via its ACA URL (if ingress is external) or check logs to ensure they started correctly.
+Test Scheduled Flow:
+Ensure a schedule is active in the Schedules table.
+Wait for the CRON time or trigger the /reload_schedules endpoint on the Scheduler Service.
+Monitor logs across all services (Orchestrator, Extractor, Parser, Loader) via Log Analytics or az containerapp logs show.
+Check for files appearing in raw-data and processed-data blob containers.
+Verify data arrival in the target Oracle table.
+Test Kafka Flow:
+Ensure a listener is active in the KafkaListeners table.
+Check Kafka Listener Service logs to confirm it subscribed to the topic.
+Produce a message to the configured Kafka topic (using Kafka tools or a simple script).
+Monitor logs across Orchestrator, Parser, Loader.
+Check for files in processed-data container.
+Verify data arrival in Oracle.
