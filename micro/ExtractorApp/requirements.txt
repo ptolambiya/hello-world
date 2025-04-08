@@ -1,0 +1,6 @@
+fastapi uvicorn python-dotenv pydantic[dotenv] httpx # For API source
+azure-storage-blob pandas # For CSV/general data handling
+# --- DB Specific ---
+oracledb # For Oracle
+pyodbc # For SQL Server, Sybase, DB2 (if using ODBC)
+mysql-connector-python # For MySQL
