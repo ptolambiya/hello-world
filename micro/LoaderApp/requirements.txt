@@ -1,0 +1,2 @@
+fastapi uvicorn python-dotenv pydantic[dotenv] azure-storage-blob pandas
+cx_Oracle SQLAlchemy # SQLAlchemy can help structure the insert even if using cx_Oracle engine
