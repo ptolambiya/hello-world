@@ -1,0 +1,1 @@
+fastapi uvicorn python-dotenv pydantic[dotenv] azure-storage-blob pandas lxml # lxml for XML
