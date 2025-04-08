@@ -1,0 +1,8 @@
+Important Considerations & Assumptions:
+
+Azure Table Storage & SQLAlchemy: SQLAlchemy is designed for relational databases. You cannot use SQLAlchemy directly with Azure Table Storage (a NoSQL key-value store). We will use the azure-data-tables SDK for Python to interact with it in the Configuration Service.
+Oracle Connectivity: Ensure your Oracle database is accessible from the Azure network where your ACA environment will reside. This might involve VNet integration for ACA, firewall rules on the Oracle side, or using Oracle Cloud Infrastructure with proper peering/interconnects. You'll need Oracle Instant Client libraries installed in your Loader and Extractor service containers.
+Confluent Kafka: Assuming you have a Confluent Cloud cluster or a self-managed Kafka cluster accessible from Azure. You'll need the bootstrap server details and any necessary credentials.
+Error Handling & Monitoring: The provided code skeletons will be basic. Production code needs robust error handling, retries (especially for network calls and DB operations), comprehensive logging (sending logs to Azure Log Analytics), and monitoring (metrics).
+Security: Connection strings, API keys, and other secrets should never be hardcoded. We'll use environment variables injected by Azure Container Apps, ideally backed by Azure Key Vault. Use Managed Identities for accessing Azure resources (Storage, potentially Key Vault) where possible.
+Data Volume: The approach using Azure Blob Storage as intermediate staging is suitable for batch processing and handles larger volumes better than passing data directly via API calls.
