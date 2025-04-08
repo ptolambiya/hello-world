@@ -1,0 +1,91 @@
+Okay, let's break down the steps to build and deploy your microservice ETL application using Azure Container Apps (ACA), FastAPI, Azure Table Storage for configuration, Confluent Kafka, and Oracle as the destination.
+
+Important Considerations & Assumptions:
+
+Azure Table Storage & SQLAlchemy: SQLAlchemy is designed for relational databases. You cannot use SQLAlchemy directly with Azure Table Storage (a NoSQL key-value store). We will use the azure-data-tables SDK for Python to interact with it in the Configuration Service.
+Oracle Connectivity: Ensure your Oracle database is accessible from the Azure network where your ACA environment will reside. This might involve VNet integration for ACA, firewall rules on the Oracle side, or using Oracle Cloud Infrastructure with proper peering/interconnects. You'll need Oracle Instant Client libraries installed in your Loader and Extractor service containers.
+Confluent Kafka: Assuming you have a Confluent Cloud cluster or a self-managed Kafka cluster accessible from Azure. You'll need the bootstrap server details and any necessary credentials.
+Error Handling & Monitoring: The provided code skeletons will be basic. Production code needs robust error handling, retries (especially for network calls and DB operations), comprehensive logging (sending logs to Azure Log Analytics), and monitoring (metrics).
+Security: Connection strings, API keys, and other secrets should never be hardcoded. We'll use environment variables injected by Azure Container Apps, ideally backed by Azure Key Vault. Use Managed Identities for accessing Azure resources (Storage, potentially Key Vault) where possible.
+Data Volume: The approach using Azure Blob Storage as intermediate staging is suitable for batch processing and handles larger volumes better than passing data directly via API calls.
+Phase 1: Azure Resource Setup (Azure Portal or Azure CLI)
+
+Resource Group: Create a Resource Group to hold all related resources.
+Bash
+
+az group create --name YourResourceGroupName --location YourAzureRegion # e.g., eastus
+Azure Storage Account: Needed for Configuration (Tables) and Data Staging (Blobs).
+Bash
+
+az storage account create --name youruniquestorageaccount --resource-group YourResourceGroupName --location YourAzureRegion --sku Standard_LRS --kind StorageV2
+# Get Connection String (Needed for local dev / initial config, use Managed Identity in ACA later)
+az storage account show-connection-string --name youruniquestorageaccount --resource-group YourResourceGroupName --output tsv
+Azure Container Registry (ACR): To store your Docker images.
+Bash
+
+az acr create --resource-group YourResourceGroupName --name youruniqueacrname --sku Basic --admin-enabled true # Use managed identity later if preferred over admin
+Log Analytics Workspace: Required by ACA Environment.
+Bash
+
+az monitor log-analytics workspace create --resource-group YourResourceGroupName --workspace-name YourLogAnalyticsWorkspace --location YourAzureRegion
+Azure Container Apps Environment: The runtime environment for your apps. Connect it to your Log Analytics workspace. (VNet integration is optional but likely needed for private Oracle/Kafka access).
+Bash
+
+# Optional: If VNet integration is needed, prepare subnet first
+# az network vnet create ...
+# az network vnet subnet create ...
+# subnet_id=$(az network vnet subnet show ... --query id --output tsv)
+
+az containerapp env create --name YourACAEnvironmentName --resource-group YourResourceGroupName --location YourAzureRegion --logs-workspace-id $(az monitor log-analytics workspace show --resource-group YourResourceGroupName --workspace-name YourLogAnalyticsWorkspace --query customerId -o tsv) --logs-workspace-key $(az monitor log-analytics workspace get-shared-keys --resource-group YourResourceGroupName --workspace-name YourLogAnalyticsWorkspace --query primarySharedKey -o tsv)
+# If using VNet: --infrastructure-subnet-resource-id $subnet_id --internal-load-balancer-outbound-ip-addresses false (or true depending on needs)
+Oracle Database: Ensure your target Oracle DB is set up and accessible. Note its connection details (Host, Port, Service Name/SID, User, Password).
+Confluent Kafka: Ensure your cluster is running. Note the Bootstrap Servers URL and any API keys/secrets needed for authentication.
+Azure Table Storage Setup:
+Within your Azure Storage Account, navigate to "Tables" (under Data storage).
+Create the necessary tables (e.g., Groups, Flows, Mappings, Schedules, KafkaListeners).
+Define your schema thinking in key-value terms (PartitionKey, RowKey are mandatory and indexed).
+Example Flows Table:
+PartitionKey: Could be the GroupName (to query all flows for a group efficiently).
+RowKey: Unique FlowID.
+Other properties: SourceType (CSV, API, DB, KAFKA), SourceConfig (JSON string with connection/path/query/topic), DestinationType (Oracle, Postgres), DestinationConfig (JSON string with connection details/table name), MappingConfig (JSON string defining column mappings).
+Example Mappings Table:
+PartitionKey: FlowID.
+RowKey: Source Column Name.
+Other properties: DestinationColumnName, DataType, TransformationRule (optional).
+Phase 2: Local Development Environment Setup
+
+Install Tools: Python 3.9+, Docker Desktop, Azure CLI, VS Code (recommended).
+Project Structure: Create a root directory. Inside, create a directory for each microservice (e.g., config_service, scheduler_service, flow_orchestrator, etc.).
+Virtual Environments: In each microservice directory, create and activate a Python virtual environment:
+Bash
+
+cd config_service
+python -m venv .venv
+source .venv/bin/activate # Linux/macOS
+# .\.venv\Scripts\activate # Windows
+Git: Initialize a Git repository.
+Phase 3: Microservice Implementation (Python Code using FastAPI)
+
+For each service, you'll typically have:
+
+main.py: FastAPI app initialization, routers.
+routers/: Directory for API route definitions.
+services/: Directory for business logic.
+models/: Directory for Pydantic models (request/response validation).
+config.py: Configuration loading (from environment variables).
+requirements.txt: Python dependencies.
+Dockerfile: Container build instructions.
+Service 1: Configuration Service
+
+Purpose: API to manage ETL configurations stored in Azure Table Storage.
+requirements.txt:
+fastapi uvicorn python-dotenv azure-data-tables pydantic
+config.py:
+Python
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv() # Loads .env file for local development
+
+AZURE_TABLE_STORAGE_CONN_STR = os.getenv("AZURE_TABLE_STORAGE_CONN_STR")
