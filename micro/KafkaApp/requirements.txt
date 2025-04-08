@@ -1,0 +1,1 @@
+fastapi uvicorn python-dotenv confluent-kafka httpx pydantic[dotenv] # pydantic[dotenv] for config
