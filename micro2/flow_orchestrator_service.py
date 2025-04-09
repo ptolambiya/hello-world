@@ -22,210 +22,322 @@ HTTP_TIMEOUT_LOAD = float(os.getenv("HTTP_TIMEOUT_LOAD", "600.0")) # Can take lo
 
 # --- flow_orchestrator_service/models/flow_models.py ---
 from pydantic import BaseModel, Field
-from typing import Optional
 
 class FlowRunRequest(BaseModel):
-    """Request model for flows triggered by scheduler."""
-    flow_id: str = Field(..., description="Unique ID of the flow.")
-    group_name: str = Field(..., description="Group the flow belongs to.")
+    flow_id: str = Field(..., description="Unique identifier for the flow configuration")
+    group_name: str = Field(..., description="The group this flow belongs to (used as PartitionKey in config)")
 
 class KafkaFlowRunRequest(FlowRunRequest):
-    """Request model for flows triggered by Kafka listener."""
-    message_data: str = Field(..., description="Raw message data received from Kafka.")
+    message_data: str = Field(..., description="The raw message content received from Kafka")
 
-class FlowRunResponse(BaseModel):
-    """Response model indicating initiation."""
-    status: str = "initiated"
+class OrchestrationResult(BaseModel):
+    status: str = "initiated" # Can be initiated, running, success, failed
+    message: str | None = None
     flow_id: str
     group_name: str
-    run_id: str # A unique ID for this specific execution instance
+    raw_data_location: str | None = None
+    processed_data_location: str | None = None
+    load_result: dict | None = None
 
-# --- flow_orchestrator_service/services/orchestration_service.py ---
+#routers/orchestrator_router.py
+from fastapi import APIRouter, HTTPException, BackgroundTasks, status, Request
 import httpx
 import logging
-import uuid
 from config import (
-    CONFIG_SERVICE_URL, EXTRACTOR_SERVICE_URL, PARSER_SERVICE_URL, LOADER_SERVICE_URL,
-    HTTP_TIMEOUT_CONFIG, HTTP_TIMEOUT_EXTRACT, HTTP_TIMEOUT_PARSE, HTTP_TIMEOUT_LOAD
+    CONFIG_SERVICE_URL, EXTRACTOR_SERVICE_URL, PARSER_SERVICE_URL,
+    LOADER_SERVICE_URL, DEFAULT_REQUEST_TIMEOUT
 )
+from models.flow_models import FlowRunRequest, KafkaFlowRunRequest, OrchestrationResult
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# Setup basic logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+)
 logger = logging.getLogger(__name__)
 
-async def execute_flow_steps(flow_id: str, group_name: str, run_id: str, kafka_message_data: Optional[str] = None):
-    """The core logic to run a flow's steps: Get Config -> Extract -> Parse -> Load."""
-    log_prefix = f"[RunID: {run_id} | Flow: {group_name}/{flow_id}]"
-    logger.info(f"{log_prefix} Orchestration starting...")
-
-    flow_config = None
-    raw_data_location = None
-    processed_data_location = None
-    source_type = None
-    final_status = "FAILED" # Default to failed unless successful completion
-
-    async with httpx.AsyncClient() as client:
-        try:
-            # 1. Get Flow Configuration
-            logger.info(f"{log_prefix} Fetching configuration...")
-            if not CONFIG_SERVICE_URL: raise ValueError("Config Service URL not set.")
-            config_url = f"{CONFIG_SERVICE_URL}/api/v1/config/flows/{group_name}/{flow_id}"
-            try:
-                response = await client.get(config_url, timeout=HTTP_TIMEOUT_CONFIG)
-                response.raise_for_status()
-                flow_config = response.json()
-                source_type = flow_config.get("SourceType", "").upper()
-                logger.info(f"{log_prefix} Configuration fetched successfully. SourceType: {source_type}")
-            except Exception as e:
-                logger.error(f"{log_prefix} Failed to get configuration: {e}")
-                raise # Stop execution if config fails
-
-            # Check if flow is enabled
-            if not flow_config.get("IsEnabled", True):
-                 logger.warning(f"{log_prefix} Flow is disabled in configuration. Skipping execution.")
-                 final_status = "SKIPPED"
-                 return # Stop execution
-
-            # --- Handle based on Source Type ---
-            if source_type == "KAFKA":
-                if kafka_message_data is None:
-                    logger.error(f"{log_prefix} Kafka flow triggered but no message data provided.")
-                    raise ValueError("Missing Kafka message data")
-                logger.info(f"{log_prefix} Source is KAFKA. Skipping extraction step.")
-                # Data for parser is the direct message content
-                parser_input_data = {"raw_data": kafka_message_data}
-            else:
-                # 2. Extract Data (for non-Kafka sources)
-                logger.info(f"{log_prefix} Calling Extractor Service...")
-                if not EXTRACTOR_SERVICE_URL: raise ValueError("Extractor Service URL not set.")
-                extract_url = f"{EXTRACTOR_SERVICE_URL}/api/v1/extract"
-                extract_payload = {
-                    "flow_id": flow_id, # Pass flow context
-                    "run_id": run_id,   # Pass run context
-                    "source_type": source_type,
-                    "source_config": flow_config.get("SourceConfig", {})
-                }
-                try:
-                    response = await client.post(extract_url, json=extract_payload, timeout=HTTP_TIMEOUT_EXTRACT)
-                    response.raise_for_status()
-                    extract_result = response.json()
-                    raw_data_location = extract_result.get("data_location")
-                    if extract_result.get("status") == "success" and raw_data_location is None:
-                        logger.info(f"{log_prefix} Extractor returned success but no data location (likely no data extracted). Skipping further steps.")
-                        final_status = "COMPLETED_NO_DATA"
-                        return # Stop flow if no data extracted
-                    elif not raw_data_location:
-                        raise ValueError(f"Extractor did not return a valid data location. Result: {extract_result}")
-                    logger.info(f"{log_prefix} Extraction successful. Raw data at: {raw_data_location}")
-                    parser_input_data = {"data_location": raw_data_location} # Data for parser is the location
-                except Exception as e:
-                    logger.error(f"{log_prefix} Extraction step failed: {e}")
-                    raise # Stop execution
-
-            # 3. Parse/Transform Data
-            logger.info(f"{log_prefix} Calling Parser Service...")
-            if not PARSER_SERVICE_URL: raise ValueError("Parser Service URL not set.")
-            parse_url = f"{PARSER_SERVICE_URL}/api/v1/parse"
-            parse_payload = {
-                "flow_id": flow_id,
-                "run_id": run_id,
-                "source_type": source_type, # Hint for the parser
-                "mapping_config": flow_config.get("MappingConfig", []),
-                **parser_input_data # Add either raw_data or data_location
-            }
-            try:
-                response = await client.post(parse_url, json=parse_payload, timeout=HTTP_TIMEOUT_PARSE)
-                response.raise_for_status()
-                parse_result = response.json()
-                processed_data_location = parse_result.get("processed_data_location")
-                if not processed_data_location:
-                     raise ValueError(f"Parser did not return a processed data location. Result: {parse_result}")
-                logger.info(f"{log_prefix} Parsing successful. Processed data at: {processed_data_location}")
-            except Exception as e:
-                logger.error(f"{log_prefix} Parsing step failed: {e}")
-                # TODO: Consider cleanup of raw_data_location if needed
-                raise # Stop execution
-
-            # 4. Load Data
-            logger.info(f"{log_prefix} Calling Loader Service...")
-            if not LOADER_SERVICE_URL: raise ValueError("Loader Service URL not set.")
-            load_url = f"{LOADER_SERVICE_URL}/api/v1/load"
-            load_payload = {
-                "flow_id": flow_id,
-                "run_id": run_id,
-                "data_location": processed_data_location,
-                "destination_config": flow_config.get("DestinationConfig", {})
-            }
-            try:
-                response = await client.post(load_url, json=load_payload, timeout=HTTP_TIMEOUT_LOAD)
-                response.raise_for_status()
-                load_result = response.json()
-                # Example success result: {"status": "success", "rows_loaded": 100}
-                logger.info(f"{log_prefix} Loading successful. Result: {load_result}")
-                final_status = "COMPLETED_SUCCESS"
-            except Exception as e:
-                logger.error(f"{log_prefix} Loading step failed: {e}")
-                # TODO: Consider cleanup of processed_data_location if needed
-                raise # Stop execution
-
-            # 5. Cleanup (Optional)
-            # TODO: Implement logic to delete intermediate files from Blob Storage
-            # if raw_data_location: delete_blob(raw_data_location)
-            # if processed_data_location: delete_blob(processed_data_location)
-            logger.info(f"{log_prefix} Optional cleanup step skipped.")
-
-        except Exception as e:
-            # Catch any exception during the steps
-            logger.error(f"{log_prefix} Orchestration failed due to an error: {e}")
-            final_status = "FAILED"
-            # Don't re-raise here, just log the final status
-
-        finally:
-            # Log the final outcome of the orchestration
-            logger.info(f"{log_prefix} Orchestration finished with status: {final_status}")
-            # TODO: Implement persistent status tracking (e.g., write status to a database table)
-
-
-# --- flow_orchestrator_service/routers/orchestrator_router.py ---
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
-import logging
-import uuid
-from models.flow_models import FlowRunRequest, KafkaFlowRunRequest, FlowRunResponse
-from services.orchestration_service import execute_flow_steps
-
-logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Dependency to generate a unique run ID for each request
-def generate_run_id() -> str:
-    return str(uuid.uuid4())
+async def execute_flow_steps(result: OrchestrationResult):
+    """The core logic to run a flow's steps. Updates result object."""
+    flow_id = result.flow_id
+    group_name = result.group_name
+    kafka_message_data = result.message # Will be set if Kafka flow
 
-@router.post("/run/flow", status_code=202, response_model=FlowRunResponse)
-async def run_scheduled_flow(
-    request: FlowRunRequest,
-    background_tasks: BackgroundTasks,
-    run_id: str = Depends(generate_run_id) # Generate unique ID for this run
-):
-    """
-    Endpoint triggered by the Scheduler Service to run a standard flow.
-    Runs the flow execution in the background.
-    """
-    log_prefix = f"[RunID: {run_id} | Flow: {request.group_name}/{request.flow_id}]"
-    logger.info(f"{log_prefix} Received request to run scheduled flow.")
-    # Add the actual flow execution logic as a background task
-    background_tasks.add_task(execute_flow_steps, request.flow_id, request.group_name, run_id)
-    # Return immediately with acceptance and run ID
-    return FlowRunResponse(flow_id=request.flow_id, group_name=request.group_name, run_id=run_id)
+    logger.info(f"[{group_name}/{flow_id}] Orchestration started.")
+    result.status = "running"
+    flow_config = None
+    source_type = None
+
+    try:
+        async with httpx.AsyncClient(timeout=DEFAULT_REQUEST_TIMEOUT) as client:
+
+            # 1. Get Flow Configuration
+            try:
+                config_url = f"{CONFIG_SERVICE_URL}/api/v1/config/flows/{group_name}/{flow_id}"
+                logger.info(f"[{group_name}/{flow_id}] Requesting config from: {config_url}")
+                response = await client.get(config_url)
+                response.raise_for_status() # Raises HTTPStatusError for 4xx/5xx
+                flow_config = response.json()
+                source_type = flow_config.get("SourceType", "").upper()
+                logger.info(f"[{group_name}/{flow_id}] Fetched config. SourceType: {source_type}")
+            except httpx.RequestError as e:
+                logger.error(f"[{group_name}/{flow_id}] Network error getting config: {e.request.url} - {e}")
+                result.status = "failed"
+                result.message = f"Network error getting config: {e}"
+                return
+            except httpx.HTTPStatusError as e:
+                logger.error(f"[{group_name}/{flow_id}] Config service error ({e.response.status_code}): {e.response.text}")
+                result.status = "failed"
+                result.message = f"Config service error ({e.response.status_code}): {e.response.text}"
+                return
+            except Exception as e:
+                logger.exception(f"[{group_name}/{flow_id}] Unexpected error getting config")
+                result.status = "failed"
+                result.message = f"Unexpected error getting config: {e}"
+                return
+
+            # Validate essential config parts
+            source_config = flow_config.get("SourceConfig", {})
+            mapping_config = flow_config.get("MappingConfig", {})
+            destination_config = flow_config.get("DestinationConfig", {})
+
+            if not source_type or not source_config or not destination_config:
+                 logger.error(f"[{group_name}/{flow_id}] Invalid flow config received: Missing SourceType, SourceConfig or DestinationConfig")
+                 result.status = "failed"
+                 result.message = "Invalid flow configuration"
+                 return
+
+            # --- Step 2: Extract Data (Skip for Kafka) ---
+            if source_type != "KAFKA":
+                try:
+                    extract_url = f"{EXTRACTOR_SERVICE_URL}/api/v1/extract"
+                    payload = {
+                        "flow_id": flow_id,
+                        "group_name": group_name, # Pass context
+                        "source_type": source_type,
+                        "source_config": source_config
+                    }
+                    logger.info(f"[{group_name}/{flow_id}] Calling Extractor: {extract_url}")
+                    response = await client.post(extract_url, json=payload)
+                    response.raise_for_status()
+                    extract_result = response.json()
+                    result.raw_data_location = extract_result.get("data_location")
+
+                    if extract_result.get("status") != "success":
+                         raise Exception(f"Extractor service reported failure: {extract_result.get('message', 'Unknown extractor error')}")
+
+                    if result.raw_data_location:
+                         logger.info(f"[{group_name}/{flow_id}] Extractor finished. Raw data at: {result.raw_data_location}")
+                    else:
+                         # Handle case where extractor succeeded but produced no data (e.g., empty query result)
+                         logger.info(f"[{group_name}/{flow_id}] Extractor finished successfully but no data was extracted.")
+                         result.status = "success" # Flow finished, just nothing to load
+                         result.message = "Extraction successful, but no data found to process."
+                         # WE MIGHT WANT TO STOP HERE unless empty files need processing downstream
+                         return
+
+                except httpx.RequestError as e:
+                    logger.error(f"[{group_name}/{flow_id}] Network error calling Extractor: {e.request.url} - {e}")
+                    result.status = "failed"
+                    result.message = f"Network error calling Extractor: {e}"
+                    return
+                except httpx.HTTPStatusError as e:
+                    logger.error(f"[{group_name}/{flow_id}] Extractor service error ({e.response.status_code}): {e.response.text}")
+                    result.status = "failed"
+                    result.message = f"Extractor service error ({e.response.status_code}): {e.response.text}"
+                    return
+                except Exception as e:
+                    logger.exception(f"[{group_name}/{flow_id}] Unexpected error during Extraction")
+                    result.status = "failed"
+                    result.message = f"Unexpected error during Extraction: {e}"
+                    return
+
+            # --- Step 3: Parse/Transform Data ---
+            try:
+                parse_url = f"{PARSER_SERVICE_URL}/api/v1/parse"
+                payload = {
+                    "flow_id": flow_id,
+                    "group_name": group_name,
+                    "source_type": source_type, # Hint for parser
+                    "mapping_config": mapping_config
+                }
+                if source_type == "KAFKA":
+                    payload["raw_data"] = kafka_message_data # Pass Kafka message directly
+                else:
+                    payload["data_location"] = result.raw_data_location # Pass blob path
+
+                logger.info(f"[{group_name}/{flow_id}] Calling Parser: {parse_url}")
+                response = await client.post(parse_url, json=payload)
+                response.raise_for_status()
+                parse_result = response.json()
+                result.processed_data_location = parse_result.get("processed_data_location")
+
+                if parse_result.get("status") != "success":
+                     raise Exception(f"Parser service reported failure: {parse_result.get('message', 'Unknown parser error')}")
+
+                if not result.processed_data_location:
+                    # This might happen if parsing resulted in no valid rows after mapping/filtering
+                    logger.info(f"[{group_name}/{flow_id}] Parser finished successfully but no processed data was generated (e.g., all rows filtered out).")
+                    result.status = "success"
+                    result.message = "Parsing successful, but no data generated after processing."
+                    # Consider cleanup of raw_data_location if needed
+                    return # Nothing to load
+
+                logger.info(f"[{group_name}/{flow_id}] Parser finished. Processed data at: {result.processed_data_location}")
+
+            except httpx.RequestError as e:
+                logger.error(f"[{group_name}/{flow_id}] Network error calling Parser: {e.request.url} - {e}")
+                result.status = "failed"
+                result.message = f"Network error calling Parser: {e}"
+                # Consider cleanup of raw_data_location
+                return
+            except httpx.HTTPStatusError as e:
+                logger.error(f"[{group_name}/{flow_id}] Parser service error ({e.response.status_code}): {e.response.text}")
+                result.status = "failed"
+                result.message = f"Parser service error ({e.response.status_code}): {e.response.text}"
+                # Consider cleanup of raw_data_location
+                return
+            except Exception as e:
+                logger.exception(f"[{group_name}/{flow_id}] Unexpected error during Parsing")
+                result.status = "failed"
+                result.message = f"Unexpected error during Parsing: {e}"
+                 # Consider cleanup of raw_data_location
+                return
+
+            # --- Step 4: Load Data ---
+            try:
+                load_url = f"{LOADER_SERVICE_URL}/api/v1/load"
+                payload = {
+                    "flow_id": flow_id,
+                    "group_name": group_name,
+                    "data_location": result.processed_data_location,
+                    "destination_config": destination_config
+                }
+                logger.info(f"[{group_name}/{flow_id}] Calling Loader: {load_url}")
+                response = await client.post(load_url, json=payload)
+                response.raise_for_status()
+                load_result_payload = response.json()
+                result.load_result = load_result_payload # Store the loader's response
+
+                if load_result_payload.get("status") != "success":
+                    raise Exception(f"Loader service reported failure: {load_result_payload.get('message', 'Unknown loader error')}")
+
+                logger.info(f"[{group_name}/{flow_id}] Loader finished. Result: {load_result_payload}")
+                result.status = "success"
+                result.message = f"Flow completed successfully. Rows loaded: {load_result_payload.get('rows_loaded', 'N/A')}"
+
+            except httpx.RequestError as e:
+                logger.error(f"[{group_name}/{flow_id}] Network error calling Loader: {e.request.url} - {e}")
+                result.status = "failed"
+                result.message = f"Network error calling Loader: {e}"
+                # Consider cleanup of processed_data_location
+                return
+            except httpx.HTTPStatusError as e:
+                logger.error(f"[{group_name}/{flow_id}] Loader service error ({e.response.status_code}): {e.response.text}")
+                result.status = "failed"
+                result.message = f"Loader service error ({e.response.status_code}): {e.response.text}"
+                 # Consider cleanup of processed_data_location
+                return
+            except Exception as e:
+                logger.exception(f"[{group_name}/{flow_id}] Unexpected error during Loading")
+                result.status = "failed"
+                result.message = f"Unexpected error during Loading: {e}"
+                 # Consider cleanup of processed_data_location
+                return
+
+            # --- Step 5: Cleanup (Optional) ---
+            # TODO: Implement logic to delete intermediate blobs in raw/processed containers if desired
+            # logger.info(f"[{group_name}/{flow_id}] Performing cleanup...")
+
+    except Exception as e:
+         # Catch-all for unexpected issues within the orchestration logic itself
+         logger.exception(f"[{group_name}/{flow_id}] Critical error during orchestration")
+         result.status = "failed"
+         result.message = f"Critical orchestration error: {e}"
+
+    finally:
+        logger.info(f"[{group_name}/{flow_id}] Orchestration finished with status: {result.status}. Message: {result.message}")
+        # TODO: Persist final 'result' state somewhere? (e.g., log analytics, status table)
 
 
-@router.post("/run/kafka_flow", status_code=202, response_model=FlowRunResponse)
-async def run_kafka_flow(
-    request: KafkaFlowRunRequest,
-    background_tasks: BackgroundTasks,
-    run_id: str = Depends(generate_run_id)
-):
-    """
-    Endpoint triggered by the Kafka Listener Service to run a flow based on a Kafka message.
-    Runs the flow execution in the background.
-    """
-    log_prefix = f"[RunID: {run_id} | Flow: {request.group_name}/{request.flow_id}]"
-    logger.info(
+@router.post("/run/flow", status_code=status.HTTP_202_ACCEPTED)
+async def run_scheduled_flow(request: FlowRunRequest, background_tasks: BackgroundTasks):
+    """Endpoint triggered by Scheduler. Runs flow asynchronously."""
+    logger.info(f"Received request to run scheduled flow: {request.group_name}/{request.flow_id}")
+    # Prepare result object to track state
+    result = OrchestrationResult(flow_id=request.flow_id, group_name=request.group_name)
+    # Run the actual flow logic in the background
+    background_tasks.add_task(execute_flow_steps, result)
+    # Immediately return 202 Accepted
+    return {"message": "Flow execution initiated", "flow_id": request.flow_id, "group_name": request.group_name}
+
+
+@router.post("/run/kafka_flow", status_code=status.HTTP_202_ACCEPTED)
+async def run_kafka_flow(request: KafkaFlowRunRequest, background_tasks: BackgroundTasks):
+    """Endpoint triggered by Kafka Listener. Runs flow asynchronously."""
+    logger.info(f"Received request to run kafka flow: {request.group_name}/{request.flow_id}")
+    # Prepare result object, adding kafka message
+    result = OrchestrationResult(
+        flow_id=request.flow_id,
+        group_name=request.group_name,
+        message=request.message_data # Store kafka message here
+    )
+    background_tasks.add_task(execute_flow_steps, result)
+    return {"message": "Kafka flow execution initiated", "flow_id": request.flow_id, "group_name": request.group_name}
+
+# Optional: Endpoint to check status (if results are persisted)
+# @router.get("/status/{group_name}/{flow_id}/{run_id}")
+# async def get_flow_status(...): ...
+
+# --- flow_orchestrator_service/main.py ---
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from routers import orchestrator_router
+import logging
+import time
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(
+    title="Flow Orchestrator Service",
+    description="Coordinates ETL flow steps (Extract, Parse, Load)",
+    version="1.0.0"
+)
+
+@app.middleware("http")
+async def add_process_time_header(request: Request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    process_time = time.time() - start_time
+    response.headers["X-Process-Time"] = str(process_time)
+    logger.debug(f"{request.method} {request.url.path} - Completed in {process_time:.4f} secs")
+    return response
+
+# Include the API router
+app.include_router(orchestrator_router.router, prefix="/api/v1/orchestrator")
+
+@app.get("/health", tags=["Health"])
+async def health_check():
+    """Simple health check endpoint"""
+    return {"status": "healthy"}
+
+# Basic root endpoint
+@app.get("/", tags=["Root"])
+def read_root():
+    return {"message": "Flow Orchestrator Service Running"}
+
+# Optional: Add global exception handler if needed
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    logger.exception(f"Unhandled exception for request {request.url.path}")
+    return JSONResponse(
+        status_code=500,
+        content={"message": "An internal server error occurred"},
+    )
+
+# If running directly using `python main.py` (for local testing)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8004) # Port for orchestrator
