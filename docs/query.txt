@@ -1,0 +1,276 @@
+1. Tables
+
+Condition: No DML activity recorded by ALL_TAB_MODIFICATIONS.
+Query: Requires MONITORING to be enabled for the table (ALTER TABLE table_name MONITORING;). This only tracks DML, not SELECTs. The TIMESTAMP column indicates the last modification time recorded, or when monitoring was last reset/table analyzed.
+SQL
+
+SELECT table_name, inserts, updates, deletes, truncated, timestamp
+FROM all_tab_modifications
+WHERE owner = 'YOUR_SCHEMA_NAME'
+AND (inserts = 0 AND updates = 0 AND deletes = 0 AND truncated = 'NO');
+-- Note: A recent timestamp with 0 activity might mean monitoring was just enabled
+-- or the table exists but has never had DML. Check LAST_DDL_TIME as well.
+Condition: No SELECT activity (requires Auditing setup).
+Setup (Example - consult Oracle documentation for best practice):
+SQL
+
+-- Enable auditing (requires ALTER SYSTEM privilege)
+-- This can generate a lot of data, use with caution!
+ALTER SYSTEM SET audit_trail=DB,EXTENDED SCOPE=SPFILE; -- Requires DB restart
+-- OR for Unified Auditing (12c+):
+-- CREATE AUDIT POLICY select_on_mytable_policy ACTIONS SELECT ON YOUR_SCHEMA_NAME.YOUR_TABLE_NAME;
+-- AUDIT POLICY select_on_mytable_policy;
+
+-- Audit SELECT on a specific table (requires AUDIT ANY privilege)
+AUDIT SELECT ON YOUR_SCHEMA_NAME.YOUR_TABLE_NAME BY ACCESS;
+-- OR for Unified Auditing:
+-- AUDIT POLICY select_on_mytable_policy BY YOUR_APP_USER;
+Query (Traditional Audit Trail):
+SQL
+
+SELECT username, obj_name, action_name, timestamp
+FROM dba_audit_trail
+WHERE owner = 'YOUR_SCHEMA_NAME'
+AND obj_name = 'YOUR_TABLE_NAME'
+AND action_name = 'SELECT'
+AND timestamp >= SYSDATE - INTERVAL '6' MONTH; -- Adjust time period
+Query (Unified Audit Trail - 12c+):
+SQL
+
+SELECT dbusername, object_schema, object_name, unified_audit_policies, event_timestamp
+FROM unified_audit_trail
+WHERE object_schema = 'YOUR_SCHEMA_NAME'
+AND object_name = 'YOUR_TABLE_NAME'
+AND action_name = 'SELECT'
+AND event_timestamp >= SYSDATE - INTERVAL '6' MONTH; -- Adjust time period
+Condition: No recent reference in V$SQL / V$SQLAREA.
+Query:
+SQL
+
+SELECT sql_fulltext, last_load_time
+FROM v$sqlarea
+WHERE upper(sql_fulltext) LIKE '%YOUR_SCHEMA_NAME.YOUR_TABLE_NAME%'
+ORDER BY last_load_time DESC;
+-- Note: Retention in v$sqlarea is limited.
+Condition: No actively used dependent objects reference it.
+Query (Find objects that depend on the table):
+SQL
+
+SELECT name, type, referenced_name, referenced_type, dependency_type
+FROM dba_dependencies
+WHERE referenced_owner = 'YOUR_SCHEMA_NAME'
+AND referenced_name = 'YOUR_TABLE_NAME'
+AND referenced_type = 'TABLE';
+-- You would then need to check the usage of the objects listed in the 'NAME' column
+-- using the appropriate queries for their type (Views, Procedures, Packages).
+2. Indexes
+
+Condition: No usage shown by monitoring.
+Setup: Enable monitoring for the index (ALTER INDEX index_name MONITORING USAGE;).
+Query (Older versions or explicit monitoring):
+SQL
+
+SELECT index_name, table_name, monitoring, used, start_monitoring, end_monitoring
+FROM dba_object_usage
+WHERE owner = 'YOUR_SCHEMA_NAME'
+AND index_name = 'YOUR_INDEX_NAME';
+-- 'USED' = 'NO' after a significant monitoring period is an indicator.
+Query (Newer versions with automatic tracking - 12c+):
+SQL
+
+SELECT owner, index_name, table_name, usage
+FROM dba_index_usage
+WHERE owner = 'YOUR_SCHEMA_NAME'
+AND index_name = 'YOUR_INDEX_NAME';
+-- Check the 'USAGE' column for activity. This view provides cumulative stats.
+3. Views
+
+Condition: Not directly queried in V$SQL / V$SQLAREA.
+Query:
+SQL
+
+SELECT sql_fulltext, last_load_time
+FROM v$sqlarea
+WHERE upper(sql_fulltext) LIKE '%YOUR_SCHEMA_NAME.YOUR_VIEW_NAME%'
+ORDER BY last_load_time DESC;
+-- Note: Retention in v$sqlarea is limited.
+Condition: No actively used dependent objects query it.
+Query (Find objects that depend on the view):
+SQL
+
+SELECT name, type, referenced_name, referenced_type, dependency_type
+FROM dba_dependencies
+WHERE referenced_owner = 'YOUR_SCHEMA_NAME'
+AND referenced_name = 'YOUR_VIEW_NAME'
+AND referenced_type = 'VIEW';
+-- Check usage of dependent PL/SQL objects and other views as described for those types.
+4. Procedures, Functions, Packages
+
+Condition: No actively used dependent objects call it.
+Query (Find objects that call this PL/SQL unit):
+SQL
+
+SELECT name, type, referenced_name, referenced_type, dependency_type
+FROM dba_dependencies
+WHERE referenced_owner = 'YOUR_SCHEMA_NAME'
+AND referenced_name = 'YOUR_PLSQL_OBJECT_NAME' -- Use package name for package
+AND referenced_type IN ('PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY');
+-- Check usage of calling objects.
+Query (Search DBA_SOURCE for calls - useful but not foolproof):
+SQL
+
+SELECT owner, name, type, line, text
+FROM dba_source
+WHERE owner = 'YOUR_SCHEMA_NAME'
+AND upper(text) LIKE '%YOUR_PLSQL_OBJECT_NAME%' -- Search for direct calls
+AND name != 'YOUR_PLSQL_OBJECT_NAME'; -- Exclude the object's own source
+-- This only finds static references in stored code, not dynamic calls or external application calls.
+Condition: No recent execution in V$SQL / V$SQLAREA.
+Query: Look for calls to the PL/SQL object within SQL statements.
+SQL
+
+SELECT sql_fulltext, last_load_time
+FROM v$sqlarea
+WHERE upper(sql_fulltext) LIKE '%YOUR_SCHEMA_NAME.YOUR_PLSQL_OBJECT_NAME%'
+ORDER BY last_load_time DESC;
+-- Note: This primarily finds calls made directly in SQL, not necessarily all executions.
+Other methods (require setup/license):
+DBMS_PROFILER: Requires running the profiler while the application is active.
+Auditing: Audit the EXECUTE action on the PL/SQL object.
+5. Triggers
+
+Condition: Associated table/event unused by application or triggered code inactive.
+Query (Find trigger details):
+SQL
+
+SELECT owner, trigger_name, trigger_type, triggering_event, table_owner, table_name, status
+FROM all_triggers
+WHERE owner = 'YOUR_SCHEMA_NAME'
+AND trigger_name = 'YOUR_TRIGGER_NAME';
+-- Check DML activity on the table (as described for Tables).
+-- Check usage of the PL/SQL code in the trigger body (analyze DBA_SOURCE for the trigger).
+Query (View trigger source):
+SQL
+
+SELECT text
+FROM dba_source
+WHERE owner = 'YOUR_SCHEMA_NAME'
+AND name = 'YOUR_TRIGGER_NAME'
+AND type = 'TRIGGER'
+ORDER BY line;
+-- Analyze the source to see what PL/SQL objects are called.
+6. Sequences
+
+Condition: No calls to NEXTVAL/CURRVAL in V$SQL / V$SQLAREA.
+Query:
+SQL
+
+SELECT sql_fulltext, last_load_time
+FROM v$sqlarea
+WHERE upper(sql_fulltext) LIKE '%YOUR_SCHEMA_NAME.YOUR_SEQUENCE_NAME.NEXTVAL%'
+OR upper(sql_fulltext) LIKE '%YOUR_SCHEMA_NAME.YOUR_SEQUENCE_NAME.CURRVAL%'
+ORDER BY last_load_time DESC;
+-- Note: Limited retention.
+Condition: No actively used dependent objects or table defaults use it.
+Query (Search DBA_SOURCE for usage):
+SQL
+
+SELECT owner, name, type, line, text
+FROM dba_source
+WHERE owner = 'YOUR_SCHEMA_NAME'
+AND upper(text) LIKE '%YOUR_SEQUENCE_NAME.NEXTVAL%'
+OR upper(text) LIKE '%YOUR_SEQUENCE_NAME.CURRVAL%';
+-- This only finds static references in stored code.
+Query (Check table column default values):
+SQL
+
+SELECT owner, table_name, column_name, data_default
+FROM all_tab_cols
+WHERE owner = 'YOUR_SCHEMA_NAME'
+AND data_default LIKE '%YOUR_SEQUENCE_NAME.NEXTVAL%';
+-- Checks for identity columns or columns with sequence default.
+7. Synonyms
+
+Condition: No actively used objects reference the synonym.
+Query (Find objects that depend on the synonym):
+SQL
+
+SELECT name, type, referenced_name, referenced_type, dependency_type
+FROM dba_dependencies
+WHERE referenced_owner = 'YOUR_SCHEMA_NAME'
+AND referenced_name = 'YOUR_SYNONYM_NAME'
+AND referenced_type = 'SYNONYM';
+-- Check usage of calling objects.
+Query (Search DBA_SOURCE for references):
+SQL
+
+SELECT owner, name, type, line, text
+FROM dba_source
+WHERE owner = 'YOUR_SCHEMA_NAME'
+AND upper(text) LIKE '%YOUR_SYNONYM_NAME%';
+-- Finds static references in stored code.
+Query (Search V$SQL/V$SQLAREA for references):
+SQL
+
+SELECT sql_fulltext, last_load_time
+FROM v$sqlarea
+WHERE upper(sql_fulltext) LIKE '%YOUR_SCHEMA_NAME.YOUR_SYNONYM_NAME%'
+ORDER BY last_load_time DESC;
+-- Finds references in recent SQL.
+8. Types
+
+Condition: No actively used tables use the type and no actively used PL/SQL objects use the type.
+Query (Find tables using the type):
+SQL
+
+SELECT owner, table_name, data_type
+FROM all_tab_columns
+WHERE owner = 'YOUR_SCHEMA_NAME'
+AND data_type = 'YOUR_TYPE_NAME';
+-- Check usage of these tables.
+Query (Find objects that depend on the type - PL/SQL that uses it):
+SQL
+
+SELECT name, type, referenced_name, referenced_type, dependency_type
+FROM dba_dependencies
+WHERE referenced_owner = 'YOUR_SCHEMA_NAME'
+AND referenced_name = 'YOUR_TYPE_NAME'
+AND referenced_type = 'TYPE';
+-- Check usage of the dependent PL/SQL objects.
+Query (Search DBA_SOURCE for type usage in variable declarations/parameters):
+SQL
+
+SELECT owner, name, type, line, text
+FROM dba_source
+WHERE owner = 'YOUR_SCHEMA_NAME'
+AND upper(text) LIKE '% YOUR_TYPE_NAME%'; -- Look for the type name after a space (common in declarations)
+-- Analyze the context of the usage in the source code.
+9. Scheduler Jobs
+
+Condition: Job is disabled or has no recent successful execution history.
+Query (Check job status and history):
+SQL
+
+SELECT owner, job_name, state, enabled, last_start_date, last_run_duration, next_run_date
+FROM dba_scheduler_jobs
+WHERE owner = 'YOUR_SCHEMA_NAME'
+AND job_name = 'YOUR_JOB_NAME';
+-- Check if ENABLED = 'FALSE' or if LAST_START_DATE is very old.
+Query (Check job run details for history):
+SQL
+
+SELECT log_id, job_name, status, actual_start_date, run_duration
+FROM dba_scheduler_job_run_details
+WHERE owner = 'YOUR_SCHEMA_NAME'
+AND job_name = 'YOUR_JOB_NAME'
+ORDER BY actual_start_date DESC;
+-- Look for recent runs and their status.
+Query (Analyze job action to see what it runs):
+SQL
+
+SELECT owner, job_name, job_action, job_type
+FROM dba_scheduler_jobs
+WHERE owner = 'YOUR_SCHEMA_NAME'
+AND job_name = 'YOUR_JOB_NAME';
+-- If the job_type is 'STORED_PROCEDURE', check the usage of that procedure.
+-- If it's 'PLSQL_BLOCK', analyze the job_action source
