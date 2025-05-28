@@ -1,0 +1,68 @@
+
+I need a python code.
+
+context : assume I have a master_table csv file with following attribute (object_name, attribute_name, code, description), object_name in above table is actually name of other csv files in file system, lets call is object file and attribute_name in master file is the list of columns in each object file we have in CSV format.
+
+now the values stores in these object file columns will match with one of master file code column values.
+
+here are some sample csv values for your reference : 
+
+master_table.csv :
+
+object_name,attribute_name,code,description
+
+obj1,col1,0,c1c1 description
+
+obj1,col1,1,c1c2 description
+
+obj1,col2,0,c2c1 description
+
+obj1,col2,1,c2c2 description
+
+obj1,col3,X,X description
+
+obj2,col1,A,A description
+
+obj2,col1,B,B description
+
+obj2,col1,C,C description
+
+obj2,col2,P,P description
+
+obj2,col2,Q,Q description
+
+obj2,col2,R,R description
+
+
+
+obj1.csv :
+
+col1,col2,col3
+
+0,0,X
+
+0,1,X
+
+1,0,X
+
+
+
+obj2.csv : 
+
+col1,col2
+
+A,P
+
+B,P
+
+c,Q
+
+a,R
+
+
+
+now I need to query each object file, lets say obj1 and enrich each attribute code values like 0,1 with respective description from master_table.csv. by matching the object_name and attribute column. 
+
+
+
+write a function in python where I pass object name and it load respective file in a table format with additional enriched column from master file as explained above.
