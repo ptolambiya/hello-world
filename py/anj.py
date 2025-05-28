@@ -1,5 +1,4 @@
 import pandas as pd
-import io
 
 def create_sample_files():
     """Creates the sample CSV files as described in the problem."""
@@ -33,27 +32,32 @@ a,R
         f.write(obj1_content)
     with open("obj2.csv", "w") as f:
         f.write(obj2_content)
-    print("Sample files (master_table.csv, obj1.csv, obj2.csv) created.")
+    print("Sample files (master_table.csv, obj1.csv, obj2.csv) created in the current directory.")
 
-def enrich_object_file(object_name: str, master_file_path: str = 'master_table.csv') -> pd.DataFrame:
+def enrich_object_file(object_name: str,
+                       master_file_path: str = 'master_table.csv',
+                       columns_to_enrich_str: str = None) -> pd.DataFrame:
     """
-    Loads an object's CSV file and enriches its columns with descriptions
+    Loads an object's CSV file and enriches specified columns with descriptions
     from a master CSV file.
 
     Args:
         object_name (str): The name of the object, corresponding to its CSV file
                            (e.g., "obj1" for "obj1.csv").
         master_file_path (str): The file path for the master table CSV.
+        columns_to_enrich_str (str, optional): A comma-separated string of column names
+                                             that should be enriched. If None, empty, or
+                                             only whitespace, all columns in the object
+                                             file will be considered for enrichment.
+                                             Defaults to None.
 
     Returns:
         pd.DataFrame: A DataFrame containing the original object data with
-                      added description columns. Returns an empty DataFrame
-                      if the object file is not found.
+                      added description columns for the specified attributes.
+                      Returns an empty DataFrame if critical files are not found.
     """
     try:
-        # Load the master table
         master_df = pd.read_csv(master_file_path)
-        # Ensure the 'code' column in master_df is string type for reliable mapping
         master_df['code'] = master_df['code'].astype(str)
     except FileNotFoundError:
         print(f"Error: Master file '{master_file_path}' not found.")
@@ -61,7 +65,6 @@ def enrich_object_file(object_name: str, master_file_path: str = 'master_table.c
 
     obj_file_path = f"{object_name}.csv"
     try:
-        # Load the specific object's CSV file
         obj_df = pd.read_csv(obj_file_path)
     except FileNotFoundError:
         print(f"Error: Object file '{obj_file_path}' not found.")
@@ -69,48 +72,90 @@ def enrich_object_file(object_name: str, master_file_path: str = 'master_table.c
 
     enriched_df = obj_df.copy()
 
-    # Iterate through each column in the object's dataframe
-    for col_name in obj_df.columns:
-        # Filter master_df for relevant mappings for the current object and column
+    # Determine which columns to process for enrichment
+    actual_cols_for_enrichment = []
+    if columns_to_enrich_str and columns_to_enrich_str.strip():
+        # User has provided specific columns
+        user_specified_cols = [col.strip() for col in columns_to_enrich_str.split(',') if col.strip()]
+        
+        valid_cols_from_user = []
+        for col_spec in user_specified_cols:
+            if col_spec in enriched_df.columns: # Check against columns in the actual object file
+                valid_cols_from_user.append(col_spec)
+            else:
+                print(f"Warning: Column '{col_spec}' specified for enrichment not found in '{obj_file_path}'. It will be ignored.")
+        actual_cols_for_enrichment = valid_cols_from_user # Process only valid columns from user list
+        
+        if not actual_cols_for_enrichment and user_specified_cols: # User specified cols but none were valid
+            print(f"Info: None of the specified columns for enrichment ('{columns_to_enrich_str}') were found or valid in '{obj_file_path}'. No enrichment will be performed beyond loading the file.")
+        elif actual_cols_for_enrichment:
+             print(f"Info: Attempting to enrich specified columns in '{obj_file_path}': {', '.join(actual_cols_for_enrichment)}.")
+
+    else:
+        # No specific columns provided by user, or string was empty/None
+        # Default to all columns present in the object file
+        actual_cols_for_enrichment = enriched_df.columns.tolist()
+        if actual_cols_for_enrichment:
+            print(f"Info: No specific columns provided via 'columns_to_enrich_str'. Attempting to enrich all columns found in '{obj_file_path}': {', '.join(actual_cols_for_enrichment)}.")
+        else: # obj_df was empty
+            print(f"Info: Object file '{obj_file_path}' has no columns to enrich.")
+
+
+    # Loop through the determined columns for enrichment
+    for col_name in actual_cols_for_enrichment:
         current_mapping_df = master_df[
             (master_df['object_name'] == object_name) &
             (master_df['attribute_name'] == col_name)
         ]
-
-        if current_mapping_df.empty:
-            # No mapping found for this column in the master table
-            enriched_df[f"{col_name}_description"] = None # Or some other placeholder like pd.NA
-            continue
-            
-        # Create a dictionary for mapping codes to descriptions
-        # {code_value: description_value}
+        
         description_map = pd.Series(
             current_mapping_df.description.values,
-            index=current_mapping_df.code # Already str type
+            index=current_mapping_df.code # 'code' is already string type
         ).to_dict()
-
-        # Add the new description column
-        # Ensure the object column is treated as string for mapping
+        
+        # Add the new description column. If description_map is empty (no rules or no matching codes),
+        # this will result in NaNs for the description column, which is expected.
         enriched_df[f"{col_name}_description"] = enriched_df[col_name].astype(str).map(description_map)
 
     return enriched_df
 
+# Main execution block
 if __name__ == '__main__':
-    # Create the sample files first
+    # Step 1: Create the sample CSV files (if they don't exist or need refreshing)
     create_sample_files()
 
-    print("\nEnriching obj1.csv:")
-    enriched_obj1_df = enrich_object_file('obj1')
-    print(enriched_obj1_df)
+    print("\n--- Test 1: Enriching obj1.csv (all columns - default behavior) ---")
+    enriched_obj1_all_df = enrich_object_file('obj1')
+    if not enriched_obj1_all_df.empty:
+        print(enriched_obj1_all_df.to_string())
 
-    print("\nEnriching obj2.csv:")
-    enriched_obj2_df = enrich_object_file('obj2')
-    print(enriched_obj2_df)
-    
-    print("\nAttempting to enrich a non-existent object file (obj3.csv):")
-    enriched_obj3_df = enrich_object_file('obj3')
-    print(enriched_obj3_df)
+    print("\n--- Test 2: Enriching obj1.csv (specific columns: 'col1, col3') ---")
+    enriched_obj1_specific_df = enrich_object_file('obj1', columns_to_enrich_str="col1, col3")
+    if not enriched_obj1_specific_df.empty:
+        print(enriched_obj1_specific_df.to_string())
 
-    print("\nAttempting to enrich with a non-existent master file:")
-    enriched_obj4_df = enrich_object_file('obj1', master_file_path='non_existent_master.csv')
-    print(enriched_obj4_df)
+    print("\n--- Test 3: Enriching obj1.csv (specific columns: 'col1, non_existent_col') ---")
+    enriched_obj1_mixed_df = enrich_object_file('obj1', columns_to_enrich_str="col1, non_existent_col")
+    if not enriched_obj1_mixed_df.empty:
+        print(enriched_obj1_mixed_df.to_string())
+
+    print("\n--- Test 4: Enriching obj1.csv (columns_to_enrich_str is empty string) ---")
+    enriched_obj1_empty_str_df = enrich_object_file('obj1', columns_to_enrich_str="   ")
+    if not enriched_obj1_empty_str_df.empty:
+        print(enriched_obj1_empty_str_df.to_string())
+
+    print("\n--- Test 5: Enriching obj2.csv (specific column: 'col1') ---")
+    enriched_obj2_specific_df = enrich_object_file('obj2', columns_to_enrich_str="col1")
+    if not enriched_obj2_specific_df.empty:
+        print(enriched_obj2_specific_df.to_string())
+
+    print("\n--- Test 6: Enriching obj1.csv (specific columns: 'non_existent_col, another_bad_col') ---")
+    enriched_obj1_none_valid_df = enrich_object_file('obj1', columns_to_enrich_str="non_existent_col, another_bad_col")
+    if not enriched_obj1_none_valid_df.empty:
+        print(enriched_obj1_none_valid_df.to_string())
+    else:
+        # This case might return the original df if all specified cols are invalid,
+        # which is not empty if obj_df loaded. Let's check output.
+        # The function is designed to return the copy of obj_df if actual_cols_for_enrichment is empty.
+        # So, if enriched_obj1_none_valid_df is not empty, it contains the original obj1 data.
+        print("Returned DataFrame contains original data as no valid columns were specified for enrichment.")
